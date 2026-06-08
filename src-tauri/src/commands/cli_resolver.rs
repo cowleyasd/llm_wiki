@@ -9,6 +9,34 @@ const PATH_MARKER: char = '\x1e';
 
 static RESOLVED_COMMANDS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
+#[cfg(not(windows))]
+static RESOLVED_SHELL_PATH: OnceLock<Option<String>> = OnceLock::new();
+
+/// PATH to hand a spawned CLI so its interpreter resolves.
+///
+/// On macOS a GUI launch (Finder/Dock) inherits launchd's minimal PATH, which
+/// omits version-manager dirs (nvm, etc.). Locating the binary already falls
+/// back to the login shell PATH; node-shim CLIs like `codex`
+/// (`#!/usr/bin/env node`) additionally need that PATH at *run* time so their
+/// shebang finds `node`. We prepend the login shell PATH to the inherited one
+/// (cached, so the shell is spawned at most once). Returns `None` when there is
+/// nothing to add, in which case the child should inherit PATH unchanged.
+#[cfg(not(windows))]
+pub(crate) fn child_path_env() -> Option<String> {
+    let shell_path = RESOLVED_SHELL_PATH
+        .get_or_init(|| login_shell_path(LOGIN_SHELL_PATH_TIMEOUT))
+        .clone()?;
+    match std::env::var("PATH") {
+        Ok(current) if !current.is_empty() => Some(format!("{shell_path}:{current}")),
+        _ => Some(shell_path),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn child_path_env() -> Option<String> {
+    None
+}
+
 pub(crate) async fn find_cli_command(
     command: &str,
     windows_candidates: &[&str],

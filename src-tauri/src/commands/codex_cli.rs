@@ -19,7 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use super::cli_resolver::find_cli_command;
+use super::cli_resolver::{child_path_env, find_cli_command};
 
 #[derive(Default)]
 pub struct CodexCliState {
@@ -84,6 +84,12 @@ pub async fn codex_cli_detect() -> Result<DetectResult, String> {
     let path_str = path.to_string_lossy().to_string();
     let mut cmd = Command::new(&path);
     suppress_windows_console(&mut cmd);
+    // `codex` is a node shim (`#!/usr/bin/env node`); under a GUI launch the
+    // inherited PATH lacks node, so hand it the login shell PATH or its
+    // shebang fails with `env: node: No such file or directory`.
+    if let Some(path_env) = child_path_env() {
+        cmd.env("PATH", path_env);
+    }
     let output = tokio::time::timeout(Duration::from_secs(3), cmd.arg("--version").output()).await;
 
     match output {
@@ -140,6 +146,11 @@ pub async fn codex_cli_spawn(
     let codex = find_codex_command().await?;
     let mut cmd = Command::new(&codex);
     suppress_windows_console(&mut cmd);
+    // See `codex_cli_detect`: the node shim needs the login shell PATH at run
+    // time so its shebang resolves `node` under a GUI launch.
+    if let Some(path_env) = child_path_env() {
+        cmd.env("PATH", path_env);
+    }
     cmd.args(build_codex_cli_args(&model, isolate_local_config));
 
     cmd.stdin(Stdio::piped())
