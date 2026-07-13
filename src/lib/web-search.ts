@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core"
 import type {
+  DeepResearchSourceId,
   SearchApiConfig,
   SearchProvider,
   SearchProviderConfigs,
@@ -7,6 +8,7 @@ import type {
   SerpApiEngine,
 } from "@/stores/wiki-store"
 import { hasConfiguredAnyTxt, normalizeAnyTxtConfig } from "@/lib/anytxt-search"
+import { hasConfiguredDeepWiki, normalizeDeepWikiConfig } from "@/lib/deepwiki-source"
 
 export interface WebSearchResult {
   title: string
@@ -39,6 +41,25 @@ export const SEARXNG_CATEGORY_OPTIONS: { value: SearXngCategory; label: string; 
   { value: "music", label: "Music", hint: "Music engines" },
   { value: "social media", label: "Social", hint: "Social media engines" },
 ]
+
+/**
+ * Resolve the active deep-research source list, migrating the legacy scalar
+ * {@link SearchApiConfig.deepResearchSource} enum to the list model. The
+ * legacy field is read here (persisted configs may still carry it) and
+ * dropped from the normalized output so consumers always read
+ * `deepResearchSources`.
+ */
+function migrateDeepResearchSources(config: SearchApiConfig): DeepResearchSourceId[] {
+  const arr = config.deepResearchSources
+  if (Array.isArray(arr) && arr.length > 0) {
+    return arr.filter((s): s is DeepResearchSourceId => s === "web" || s === "anytxt" || s === "deepwiki")
+  }
+  const legacy = config.deepResearchSource
+  if (legacy === "web") return ["web"]
+  if (legacy === "anytxt") return ["anytxt"]
+  if (legacy === "both") return ["web", "anytxt"]
+  return ["web"]
+}
 
 export function resolveSearchConfig(config: SearchApiConfig): SearchApiConfig {
   const providerConfigs: SearchProviderConfigs = config.providerConfigs ?? {
@@ -86,8 +107,10 @@ export function resolveSearchConfig(config: SearchApiConfig): SearchApiConfig {
       searXngCategories: config.searXngCategories ?? providerConfigs.searxng?.searXngCategories ?? ["general"],
       ollamaUrl: providerConfigs.ollama?.ollamaUrl ?? "https://ollama.com",
       providerConfigs,
-      deepResearchSource: config.deepResearchSource ?? "web",
+      deepResearchSources: migrateDeepResearchSources(config),
+      deepResearchSource: undefined,
       anyTxt: normalizeAnyTxtConfig(config.anyTxt),
+      deepWiki: normalizeDeepWikiConfig(config.deepWiki),
     }
   }
 
@@ -100,8 +123,10 @@ export function resolveSearchConfig(config: SearchApiConfig): SearchApiConfig {
     searXngCategories: activeOverride?.searXngCategories ?? config.searXngCategories ?? ["general"],
     ollamaUrl: resolvedOllamaUrl,
     providerConfigs,
-    deepResearchSource: config.deepResearchSource ?? "web",
+    deepResearchSources: migrateDeepResearchSources(config),
+    deepResearchSource: undefined,
     anyTxt: normalizeAnyTxtConfig(config.anyTxt),
+    deepWiki: normalizeDeepWikiConfig(config.deepWiki),
   }
 }
 
@@ -116,13 +141,17 @@ export function hasConfiguredSearchProvider(config: SearchApiConfig): boolean {
 
 export function hasConfiguredDeepResearchSources(config: SearchApiConfig): boolean {
   const resolved = resolveSearchConfig(config)
-  const source = resolved.deepResearchSource ?? "web"
-  const webConfigured = hasConfiguredSearchProvider(resolved)
-  const anyTxtConfigured = hasConfiguredAnyTxt(resolved.anyTxt)
-
-  if (source === "web") return webConfigured
-  if (source === "anytxt") return anyTxtConfigured
-  return webConfigured || anyTxtConfigured
+  const sources = resolved.deepResearchSources ?? ["web"]
+  if (sources.length === 0) return false
+  // Every selected source must be configured. The previous "any one is enough"
+  // gate let a selected-but-unconfigured source silently through to research,
+  // which then resolved the review item on the other source's success.
+  return sources.every((source) => {
+    if (source === "web") return hasConfiguredSearchProvider(resolved)
+    if (source === "anytxt") return hasConfiguredAnyTxt(resolved.anyTxt)
+    if (source === "deepwiki") return hasConfiguredDeepWiki(resolved.deepWiki)
+    return false
+  })
 }
 
 export async function webSearch(

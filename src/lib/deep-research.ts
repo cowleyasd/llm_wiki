@@ -1,10 +1,13 @@
 import { anyTxtSearchSmart, hasConfiguredAnyTxt } from "./anytxt-search"
-import { hasConfiguredSearchProvider, resolveSearchConfig, webSearch } from "./web-search"
+import { hasConfiguredSearchProvider, resolveSearchConfig, webSearch, type WebSearchResult } from "./web-search"
+import { deepWikiSearch, hasConfiguredDeepWiki } from "./deepwiki-source"
+import type { GapContext, ResearchContext, ReviewItemSnapshot } from "./deepwiki-assembly"
 import { streamChat } from "./llm-client"
 import { currentWikiDate } from "./ingest"
 import { writeFile, readFile } from "@/commands/fs"
 import { useWikiStore, type LlmConfig, type SearchApiConfig } from "@/stores/wiki-store"
 import { useResearchStore } from "@/stores/research-store"
+import { useReviewStore } from "@/stores/review-store"
 import { normalizePath } from "@/lib/path-utils"
 import { buildLanguageDirective } from "@/lib/output-language"
 import { makeQueryFileName } from "@/lib/wiki-filename"
@@ -15,18 +18,25 @@ const MAX_RESEARCH_SOURCES = 20
 interface ResearchSourceDeps {
   webSearch: typeof webSearch
   anyTxtSearch: typeof anyTxtSearchSmart
+  deepWikiSearch: typeof deepWikiSearch
 }
 
 interface CollectResearchSourceOptions {
   llmConfig?: LlmConfig
+  context?: ResearchContext
+}
+
+export interface ResearchSourceError {
+  source: string
+  message: string
 }
 
 interface ResearchSourceCollection {
-  results: import("./web-search").WebSearchResult[]
-  errors: string[]
+  results: WebSearchResult[]
+  errors: ResearchSourceError[]
 }
 
-export function noResearchSourcesTaskPatch(sourceErrors: string[]): {
+export function noResearchSourcesTaskPatch(sourceErrors: ResearchSourceError[]): {
   status: "done" | "error"
   synthesis: string
   error: string | null
@@ -38,7 +48,7 @@ export function noResearchSourcesTaskPatch(sourceErrors: string[]): {
     return {
       status: "error",
       synthesis: "",
-      error: sourceErrors.join("\n"),
+      error: sourceErrors.map((e) => `[${e.source}] ${e.message}`).join("\n"),
     }
   }
   return {
@@ -57,6 +67,17 @@ export function makeDeepResearchFileName(topic: string, now: Date = new Date()):
 }
 
 /**
+ * Context carried from a research trigger (review item, graph gap, etc.) into
+ * the task. Only the fields needed for DeepWiki prompt assembly are snapshotted;
+ * the review item is NOT stored wholesale to avoid stale-snapshot drift.
+ */
+export interface ResearchTriggerContext {
+  reviewItemId?: string
+  reviewItem?: ReviewItemSnapshot
+  gapContext?: GapContext
+}
+
+/**
  * Queue a deep research task. Automatically starts processing if under concurrency limit.
  */
 export function queueResearch(
@@ -65,12 +86,22 @@ export function queueResearch(
   llmConfig: LlmConfig,
   searchConfig: SearchApiConfig,
   searchQueries?: string[],
+  trigger?: ResearchTriggerContext,
 ): string {
   const store = useResearchStore.getState()
   const taskId = store.addTask(topic)
   // Store search queries on the task
   if (searchQueries && searchQueries.length > 0) {
     store.updateTask(taskId, { searchQueries })
+  }
+  if (trigger) {
+    store.updateTask(taskId, {
+      reviewItemId: trigger.reviewItemId,
+      researchContext: {
+        reviewItem: trigger.reviewItem,
+        gapContext: trigger.gapContext,
+      },
+    })
   }
   // Ensure panel is open
   store.setPanelOpen(true)
@@ -81,24 +112,43 @@ export function queueResearch(
   return taskId
 }
 
+async function trackSourceCall(
+  source: string,
+  p: Promise<WebSearchResult[]>,
+): Promise<{ source: string; results: WebSearchResult[]; error: string | null }> {
+  try {
+    const results = await p
+    return { source, results, error: null }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.warn(`[DeepResearch] source "${source}" failed:`, message)
+    return { source, results: [], error: message }
+  }
+}
+
 export async function collectResearchSources(
   queries: string[],
   searchConfig: SearchApiConfig,
   projectPath: string,
-  deps: ResearchSourceDeps = { webSearch, anyTxtSearch: anyTxtSearchSmart },
+  deps: ResearchSourceDeps = { webSearch, anyTxtSearch: anyTxtSearchSmart, deepWikiSearch },
   options: CollectResearchSourceOptions = {},
 ): Promise<ResearchSourceCollection> {
   const resolvedSearchConfig = resolveSearchConfig(searchConfig)
-  const sourceMode = resolvedSearchConfig.deepResearchSource ?? "web"
-  const useWeb = sourceMode === "web" || sourceMode === "both"
-  const useAnyTxt = hasAnyTxtSource(resolvedSearchConfig) && hasConfiguredAnyTxt(resolvedSearchConfig.anyTxt)
+  const sources = resolvedSearchConfig.deepResearchSources ?? ["web"]
+  const useWeb = sources.includes("web")
+  const useAnyTxt = sources.includes("anytxt")
+  const useDeepWiki = sources.includes("deepwiki")
+
   const webConfigured = hasConfiguredSearchProvider(resolvedSearchConfig)
-  const allResults: import("./web-search").WebSearchResult[] = []
-  const errors: string[] = []
+  const anyTxtConfigured = hasConfiguredAnyTxt(resolvedSearchConfig.anyTxt)
+  const deepWikiConfigured = hasConfiguredDeepWiki(resolvedSearchConfig.deepWiki)
+
+  const allResults: WebSearchResult[] = []
+  const errors: ResearchSourceError[] = []
   const seenUrls = new Set<string>()
   let cappedWarned = false
 
-  function addResults(results: import("./web-search").WebSearchResult[]) {
+  function addResults(results: WebSearchResult[]) {
     for (const r of results) {
       if (allResults.length >= MAX_RESEARCH_SOURCES) {
         if (!cappedWarned) {
@@ -116,34 +166,79 @@ export async function collectResearchSources(
   }
 
   const webQueries = queries.map((q) => q.trim()).filter(Boolean)
-  const calls: Array<Promise<{ results: import("./web-search").WebSearchResult[] }>> = []
+  const trackedCalls: Array<Promise<{ source: string; results: WebSearchResult[]; error: string | null }>> = []
 
-  for (const webQuery of webQueries) {
-    if (useWeb && webConfigured && webQuery) {
-      calls.push(deps.webSearch(webQuery, resolvedSearchConfig, 5).then((results) => ({ results })))
+  // A selected-but-unconfigured source is a failure, not a silent skip -
+  // otherwise synthesis could proceed on the other source's success and
+  // resolve a review item that never got the DeepWiki material the user asked for.
+  if (useWeb) {
+    if (webConfigured) {
+      for (const webQuery of webQueries) {
+        if (webQuery) {
+          trackedCalls.push(trackSourceCall("web", deps.webSearch(webQuery, resolvedSearchConfig, 5)))
+        }
+      }
+    } else {
+      errors.push({ source: "web", message: "Web search provider not configured" })
     }
   }
+
   if (useAnyTxt) {
-    calls.push(deps.anyTxtSearch(queries, resolvedSearchConfig.anyTxt, options.llmConfig, 15, projectPath).then((results) => ({ results })))
+    if (anyTxtConfigured) {
+      trackedCalls.push(
+        trackSourceCall(
+          "anytxt",
+          deps.anyTxtSearch(queries, resolvedSearchConfig.anyTxt, options.llmConfig, 15, projectPath),
+        ),
+      )
+    } else {
+      errors.push({ source: "anytxt", message: "AnyTXT local search not configured" })
+    }
   }
 
-  const settled = await Promise.allSettled(calls)
-  for (const item of settled) {
-    if (item.status === "fulfilled") {
-      addResults(item.value.results)
+  // DeepWiki runs concurrently with web/anytxt but its result is appended
+  // separately after settle, bypassing the 20-result cap: it is a single
+  // long-form answer, not a search hit competing for a slot.
+  let deepWikiTracked: Promise<{ source: string; results: WebSearchResult[]; error: string | null }> | null = null
+  if (useDeepWiki) {
+    if (deepWikiConfigured && options.context && options.llmConfig) {
+      deepWikiTracked = trackSourceCall(
+        "deepwiki",
+        deps.deepWikiSearch(options.context, resolvedSearchConfig.deepWiki!, options.llmConfig),
+      )
+    } else if (!deepWikiConfigured) {
+      errors.push({ source: "deepwiki", message: "DeepWiki source not configured" })
     } else {
-      const message = item.reason instanceof Error ? item.reason.message : String(item.reason)
-      errors.push(message)
-      console.warn("[DeepResearch] source search failed:", message)
+      errors.push({ source: "deepwiki", message: "DeepWiki missing research context or LLM config" })
+    }
+  }
+
+  const settled = await Promise.all(trackedCalls)
+  for (const item of settled) {
+    if (item.error) {
+      errors.push({ source: item.source, message: item.error })
+    } else {
+      addResults(item.results)
+    }
+  }
+
+  if (deepWikiTracked) {
+    const dw = await deepWikiTracked
+    if (dw.error) {
+      errors.push({ source: "deepwiki", message: dw.error })
+    } else {
+      // Bypass the 20-cap; just dedupe.
+      for (const r of dw.results) {
+        const key = (r.url || `${r.source}:${r.title}:${r.snippet}`).toLowerCase()
+        if (!seenUrls.has(key)) {
+          seenUrls.add(key)
+          allResults.push(r)
+        }
+      }
     }
   }
 
   return { results: allResults, errors }
-}
-
-function hasAnyTxtSource(searchConfig: SearchApiConfig): boolean {
-  const sourceMode = searchConfig.deepResearchSource ?? "web"
-  return sourceMode === "anytxt" || sourceMode === "both"
 }
 
 function isActiveProjectPath(projectPath: string): boolean {
@@ -199,18 +294,52 @@ async function executeResearch(
     const queries = task?.searchQueries && task.searchQueries.length > 0
       ? task.searchQueries
       : [topic]
+
+    // Read wiki index + purpose up front: the index feeds both the DeepWiki
+    // prompt assembly (as context) and the synthesis (for cross-referencing),
+    // and purpose feeds the assembly. Reading once avoids a duplicate read at
+    // synthesis time.
+    let wikiIndex = ""
+    try {
+      wikiIndex = await readFile(`${pp}/wiki/index.md`)
+    } catch {
+      // no index yet
+    }
+    let purpose = ""
+    try {
+      purpose = await readFile(`${pp}/wiki/purpose.md`)
+    } catch {
+      // no purpose yet
+    }
+
+    const researchContext: ResearchContext = {
+      topic,
+      reviewItem: task?.researchContext?.reviewItem,
+      gapContext: task?.researchContext?.gapContext,
+      wikiIndex,
+      purpose,
+    }
+
     const { results: allResults, errors: sourceErrors } = await collectResearchSources(
       queries,
       searchConfig,
       pp,
-      { webSearch, anyTxtSearch: anyTxtSearchSmart },
-      { llmConfig },
+      { webSearch, anyTxtSearch: anyTxtSearchSmart, deepWikiSearch },
+      { llmConfig, context: researchContext },
     )
     if (!isActiveProjectPath(pp)) return
 
     const webResults = allResults
     if (!updateTaskIfActive(pp, taskId, { webResults })) return
 
+    // Any selected source failing is fatal: abort before synthesis rather
+    // than saving a partial page and resolving the review item. This matches
+    // the "DeepWiki failure -> review item stays pending" contract.
+    if (sourceErrors.length > 0) {
+      if (!updateTaskIfActive(pp, taskId, noResearchSourcesTaskPatch(sourceErrors))) return
+      if (isActiveProjectPath(pp)) onTaskFinished(pp, llmConfig, searchConfig)
+      return
+    }
     if (webResults.length === 0) {
       if (!updateTaskIfActive(pp, taskId, noResearchSourcesTaskPatch(sourceErrors))) return
       if (isActiveProjectPath(pp)) onTaskFinished(pp, llmConfig, searchConfig)
@@ -223,14 +352,6 @@ async function executeResearch(
     const searchContext = webResults
       .map((r, i) => `[${i + 1}] **${r.title}** (${r.source})\n${r.snippet}`)
       .join("\n\n")
-
-    // Read existing wiki index to enable cross-referencing
-    let wikiIndex = ""
-    try {
-      wikiIndex = await readFile(`${pp}/wiki/index.md`)
-    } catch {
-      // no index yet
-    }
 
     const systemPrompt = [
       "You are a research assistant. Synthesize the collected research sources into a comprehensive wiki page.",
@@ -323,6 +444,19 @@ async function executeResearch(
 
     await writeFile(filePath, pageContent)
     const savedPath = `wiki/queries/${fileName}`
+
+    // Resolve the triggering review item only after the page is durably
+    // saved. Earlier code resolved at queue time, which lost the item if
+    // research later failed. Refresh/embedding below are best-effort and
+    // must not gate resolution.
+    const reviewItemId = task?.reviewItemId
+    if (reviewItemId) {
+      try {
+        useReviewStore.getState().resolveItem(reviewItemId, "Researched")
+      } catch (err) {
+        console.warn("[DeepResearch] failed to resolve review item:", err)
+      }
+    }
 
     if (!updateTaskIfActive(pp, taskId, {
       status: "done",

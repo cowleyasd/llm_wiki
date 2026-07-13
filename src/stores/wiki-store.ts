@@ -53,6 +53,8 @@ export type SearchProvider =
   | "firecrawl"
   | "none"
 export type DeepResearchSource = "web" | "anytxt" | "both"
+/** Selectable deep-research information sources (list model, supersedes the legacy scalar {@link DeepResearchSource}). */
+export type DeepResearchSourceId = "web" | "anytxt" | "deepwiki"
 export type SerpApiEngine =
   | "google"
   | "google_news"
@@ -95,6 +97,23 @@ export interface AnyTxtConfig {
   limit?: number
 }
 
+/**
+ * Configuration for the DeepWiki source: a direct HTTP SSE query against the
+ * internal DeepWiki knowledge base. The prompt sent to DeepWiki is assembled
+ * by an LLM from the research context plus {@link assemblyInstruction}.
+ */
+export interface DeepWikiSourceConfig {
+  enabled?: boolean
+  baseUrl?: string
+  token?: string
+  spaceId?: string
+  model?: string
+  branch?: string
+  assemblyInstruction?: string
+  timeoutSecs?: number
+  maxSnippetChars?: number
+}
+
 interface SearchApiConfig {
   provider: SearchProvider
   apiKey: string
@@ -103,8 +122,11 @@ interface SearchApiConfig {
   searXngCategories?: SearXngCategory[]
   ollamaUrl?: string
   providerConfigs?: SearchProviderConfigs
+  /** @deprecated Legacy scalar source mode; migrated to {@link deepResearchSources} by `resolveSearchConfig`. */
   deepResearchSource?: DeepResearchSource
+  deepResearchSources?: DeepResearchSourceId[]
   anyTxt?: AnyTxtConfig
+  deepWiki?: DeepWikiSourceConfig
 }
 
 interface EmbeddingConfig {
@@ -497,13 +519,26 @@ export const useWikiStore = create<WikiState>((set) => ({
     searXngUrl: "",
     searXngCategories: ["general"],
     providerConfigs: {},
-    deepResearchSource: "web",
+    deepResearchSources: ["web"],
     anyTxt: {
       enabled: false,
       endpoint: "http://127.0.0.1:9920",
       filterDir: "",
       filterExt: "*",
       limit: 20,
+    },
+    deepWiki: {
+      // No built-in connection defaults — user must supply their own
+      // DeepWiki endpoint, space, model, branch, token, and timeout.
+      enabled: false,
+      baseUrl: "",
+      token: "",
+      spaceId: "",
+      model: "",
+      branch: "",
+      assemblyInstruction: "",
+      timeoutSecs: 0,
+      maxSnippetChars: 0,
     },
   },
 

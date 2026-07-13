@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from "react"
-import { queueResearch } from "@/lib/deep-research"
+import { queueResearch, type ResearchTriggerContext } from "@/lib/deep-research"
 import {
   AlertTriangle,
   Copy,
@@ -23,6 +23,21 @@ import { makeQueryFileName } from "@/lib/wiki-filename"
 import { createReviewPageDrafts } from "@/lib/review-create-page"
 import { cleanAssistantContentForWikiSave, titleFromCleanAssistantContent } from "@/lib/chat-save-to-wiki"
 import { useTranslation } from "react-i18next"
+
+/** Build the research trigger context from a review item: snapshots only the
+ * fields DeepWiki prompt assembly needs (not the whole item, to avoid stale
+ * snapshots after refresh/resolve) plus the id for post-save resolution. */
+function buildResearchTrigger(item: ReviewItem): ResearchTriggerContext {
+  return {
+    reviewItemId: item.id,
+    reviewItem: {
+      title: item.title,
+      description: item.description,
+      type: item.type,
+      searchQueries: item.searchQueries,
+    },
+  }
+}
 
 const typeConfig: Record<ReviewItem["type"], { icon: typeof AlertTriangle; label: string; color: string }> = {
   contradiction: { icon: AlertTriangle, label: "Contradiction", color: "text-amber-500" },
@@ -76,8 +91,10 @@ export function ReviewView() {
         const llmConfig = useWikiStore.getState().llmConfig
         // Use pre-generated search queries if available, otherwise fall back to title
         const topic = item.title.replace(/^(Save to Wiki|Create|Research)[:\s]*/i, "").trim() || item.description.split("\n")[0]
-        queueResearch(pp, topic, llmConfig, searchConfig, item.searchQueries)
-        resolveItem(id, "Queued for research")
+        // Do NOT resolve here - executeResearch resolves the review item only
+        // after the research page is durably saved. A failure leaves the item
+        // pending so the user can retry.
+        queueResearch(pp, topic, llmConfig, searchConfig, item.searchQueries, buildResearchTrigger(item))
       } else {
         resolveItem(id, action)
       }
@@ -178,8 +195,7 @@ export function ReviewView() {
       if (item) {
         const llmConfig = useWikiStore.getState().llmConfig
         const topic = action.replace(/^research\s*/i, "").trim() || item.description.split("\n")[0]
-        queueResearch(pp, topic, llmConfig, searchConfig)
-        resolveItem(id, "Queued for deep research")
+        queueResearch(pp, topic, llmConfig, searchConfig, item.searchQueries, buildResearchTrigger(item))
       } else {
         resolveItem(id, action)
       }
@@ -306,6 +322,26 @@ export function ReviewView() {
     setSelectedReviewIds(new Set())
   }, [dismissItem, selectedPendingIds])
 
+  const handleBatchDeepResearch = useCallback(() => {
+    if (!project) return
+    const pp = normalizePath(project.path)
+    const searchConfig = useWikiStore.getState().searchApiConfig
+    if (!hasConfiguredDeepResearchSources(searchConfig)) {
+      window.alert(t("research.notConfigured"))
+      return
+    }
+    const llmConfig = useWikiStore.getState().llmConfig
+    // Queue each selected item; the research store's maxConcurrent throttles
+    // to 3 in flight. Review items are resolved per-task on successful save.
+    for (const id of selectedPendingIds) {
+      const item = pending.find((i) => i.id === id)
+      if (!item) continue
+      const topic = item.title.replace(/^(Save to Wiki|Create|Research)[:\s]*/i, "").trim() || item.description.split("\n")[0]
+      queueResearch(pp, topic, llmConfig, searchConfig, item.searchQueries, buildResearchTrigger(item))
+    }
+    setSelectedReviewIds(new Set())
+  }, [project, selectedPendingIds, pending, t])
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b px-4 py-3">
@@ -369,6 +405,16 @@ export function ReviewView() {
             onClick={handleBatchDismiss}
           >
             {t("review.dismissSelected")}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            disabled={selectedPendingIds.length === 0}
+            onClick={handleBatchDeepResearch}
+            title={t("review.deepResearchSelectedHint", "Run deep research on each selected item")}
+          >
+            {t("review.deepResearchSelected", "Deep Research Selected")}
           </Button>
         </div>
       )}

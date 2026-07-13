@@ -1,5 +1,6 @@
 import { create } from "zustand"
 import type { WebSearchResult } from "@/lib/web-search"
+import type { GapContext, ReviewItemSnapshot } from "@/lib/deepwiki-assembly"
 
 export interface ResearchTask {
   id: string
@@ -11,6 +12,13 @@ export interface ResearchTask {
   savedPath: string | null
   error: string | null
   createdAt: number
+  /** Review item that triggered this research, resolved only after a successful save. */
+  reviewItemId?: string
+  /** Snapshot context (review item / graph gap) for DeepWiki prompt assembly. */
+  researchContext?: {
+    reviewItem?: ReviewItemSnapshot
+    gapContext?: GapContext
+  }
 }
 
 interface ResearchState {

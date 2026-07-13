@@ -647,6 +647,7 @@ pub fn run() {
             commands::search::get_page_links,
             commands::external_search::web_search,
             commands::external_search::anytxt_search,
+            commands::deepwiki_search::deepwiki_search,
             clip_server_status,
             api_server_status,
             api_server_reload_config,

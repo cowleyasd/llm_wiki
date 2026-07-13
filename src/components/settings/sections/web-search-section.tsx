@@ -6,12 +6,14 @@ import { Label } from "@/components/ui/label"
 import {
   useWikiStore,
   type AnyTxtConfig,
-  type DeepResearchSource,
+  type DeepResearchSourceId,
+  type DeepWikiSourceConfig,
   type SearchApiConfig,
   type SearchProvider,
   type SearchProviderOverride,
 } from "@/stores/wiki-store"
 import { normalizeAnyTxtConfig } from "@/lib/anytxt-search"
+import { normalizeDeepWikiConfig } from "@/lib/deepwiki-source"
 import {
   SEARXNG_CATEGORY_OPTIONS,
   SERPAPI_ENGINE_OPTIONS,
@@ -138,8 +140,27 @@ export function WebSearchSection() {
     }
   }
 
-  function updateDeepResearchSource(deepResearchSource: DeepResearchSource) {
-    persist(resolveSearchConfig({ ...resolvedConfig, deepResearchSource })).catch(() => {})
+  function toggleDeepResearchSource(source: DeepResearchSourceId) {
+    const current: DeepResearchSourceId[] = resolvedConfig.deepResearchSources ?? ["web"]
+    const next = current.includes(source)
+      ? current.filter((s) => s !== source)
+      : [...current, source]
+    // Never empty - keep web as the fallback if the user deselects everything.
+    const sources: DeepResearchSourceId[] = next.length > 0 ? next : ["web"]
+    persist(resolveSearchConfig({ ...resolvedConfig, deepResearchSources: sources })).catch(() => {})
+  }
+
+  function updateDeepWiki(patch: DeepWikiSourceConfig) {
+    const next = resolveSearchConfig({
+      ...resolvedConfig,
+      deepWiki: {
+        ...normalizeDeepWikiConfig(resolvedConfig.deepWiki),
+        ...patch,
+      },
+    })
+    persist(next).catch(() => {})
+    setSavedId("deepwiki")
+    setTimeout(() => setSavedId((cur) => (cur === "deepwiki" ? null : cur)), 1500)
   }
 
   function updateAnyTxt(patch: AnyTxtConfig) {
@@ -173,25 +194,41 @@ export function WebSearchSection() {
         </div>
         <div className="grid gap-2 sm:grid-cols-3">
           {([
-            ["web", t("settings.sections.webSearch.sourceWeb")],
-            ["anytxt", t("settings.sections.webSearch.sourceAnyTxt")],
-            ["both", t("settings.sections.webSearch.sourceBoth")],
-          ] as const).map(([value, label]) => (
-            <button
-              key={value}
-              type="button"
-              onClick={() => updateDeepResearchSource(value)}
-              className={`rounded-md border px-3 py-2 text-left text-sm transition-colors ${
-                (resolvedConfig.deepResearchSource ?? "web") === value
-                  ? "border-primary bg-primary text-primary-foreground"
-                  : "border-border hover:bg-accent"
-              }`}
-            >
-              {label}
-            </button>
-          ))}
+            "web",
+            "anytxt",
+            "deepwiki",
+          ] as const).map((source) => {
+            const selected = (resolvedConfig.deepResearchSources ?? ["web"]).includes(source)
+            const label = source === "web"
+              ? t("settings.sections.webSearch.sourceWeb")
+              : source === "anytxt"
+                ? t("settings.sections.webSearch.sourceAnyTxt")
+                : t("settings.sections.webSearch.sourceDeepWiki", "DeepWiki")
+            return (
+              <button
+                key={source}
+                type="button"
+                onClick={() => toggleDeepResearchSource(source)}
+                className={`rounded-md border px-3 py-2 text-left text-sm transition-colors ${
+                  selected
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-border hover:bg-accent"
+                }`}
+              >
+                {label}
+              </button>
+            )
+          })}
         </div>
+        <p className="text-xs text-muted-foreground">
+          {t("settings.sections.webSearch.deepResearchSourcesMultiHint", "Select one or more. Every selected source must be configured, and any source failing aborts the research.")}
+        </p>
       </div>
+
+      <DeepWikiConfigCard
+        resolvedConfig={resolvedConfig}
+        onSave={updateDeepWiki}
+      />
 
       <div className="space-y-3 rounded-lg border p-3">
         <div className="flex items-start justify-between gap-3">
@@ -548,6 +585,112 @@ function SerpApiEnginePicker({
         <p className="text-xs text-muted-foreground">
           {t("settings.sections.webSearch.customSerpApiHint")}
         </p>
+      )}
+    </div>
+  )
+}
+
+function DeepWikiConfigCard({
+  resolvedConfig,
+  onSave,
+}: {
+  resolvedConfig: SearchApiConfig
+  onSave: (patch: DeepWikiSourceConfig) => void
+}) {
+  const { t } = useTranslation()
+  const cfg = normalizeDeepWikiConfig(resolvedConfig.deepWiki)
+
+  return (
+    <div className="space-y-3 rounded-lg border p-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <Label>{t("settings.sections.webSearch.sourceDeepWiki", "DeepWiki")}</Label>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {t(
+              "settings.sections.webSearch.deepWikiHint",
+              "Query the internal DeepWiki knowledge base via direct HTTP. An LLM assembles the query prompt from the research context, then sends it to DeepWiki."
+            )}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => onSave({ enabled: !cfg.enabled })}
+          className={`rounded-md border px-3 py-1 text-xs transition-colors ${
+            cfg.enabled
+              ? "border-primary bg-primary text-primary-foreground"
+              : "border-border hover:bg-accent"
+          }`}
+        >
+          {cfg.enabled
+            ? t("settings.sections.webSearch.deepWikiEnabled", "Enabled")
+            : t("settings.sections.webSearch.deepWikiDisabled", "Disabled")}
+        </button>
+      </div>
+      {cfg.enabled && (
+        <div className="space-y-3">
+          <div className="space-y-1">
+            <Label className="text-xs">{t("settings.sections.webSearch.deepWikiBaseUrl", "Base URL")}</Label>
+            <Input value={cfg.baseUrl} onChange={(e) => onSave({ baseUrl: e.target.value })} />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs">{t("settings.sections.webSearch.deepWikiToken", "Token")}</Label>
+            <Input
+              type="password"
+              value={cfg.token}
+              onChange={(e) => onSave({ token: e.target.value })}
+              placeholder={t(
+                "settings.sections.webSearch.deepWikiTokenPlaceholder",
+                "Leave empty to fall back to ~/.claude/deepwiki.config.json"
+              )}
+            />
+          </div>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <div className="space-y-1">
+              <Label className="text-xs">{t("settings.sections.webSearch.deepWikiSpaceId", "Space ID")}</Label>
+              <Input value={cfg.spaceId} onChange={(e) => onSave({ spaceId: e.target.value })} />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">{t("settings.sections.webSearch.deepWikiModel", "Model")}</Label>
+              <Input value={cfg.model} onChange={(e) => onSave({ model: e.target.value })} />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">{t("settings.sections.webSearch.deepWikiBranch", "Branch")}</Label>
+              <Input value={cfg.branch} onChange={(e) => onSave({ branch: e.target.value })} />
+            </div>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label className="text-xs">{t("settings.sections.webSearch.deepWikiTimeout", "Timeout (seconds)")}</Label>
+              <Input
+                type="number"
+                value={cfg.timeoutSecs}
+                onChange={(e) => onSave({ timeoutSecs: Number(e.target.value) || 600 })}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label className="text-xs">{t("settings.sections.webSearch.deepWikiMaxSnippet", "Max snippet chars")}</Label>
+              <Input
+                type="number"
+                value={cfg.maxSnippetChars}
+                onChange={(e) => onSave({ maxSnippetChars: Number(e.target.value) || 4000 })}
+              />
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label className="text-xs">
+              {t("settings.sections.webSearch.deepWikiAssemblyInstruction", "Assembly instruction (optional)")}
+            </Label>
+            <textarea
+              className="min-h-[80px] w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              value={cfg.assemblyInstruction}
+              onChange={(e) => onSave({ assemblyInstruction: e.target.value })}
+              placeholder={t(
+                "settings.sections.webSearch.deepWikiAssemblyPlaceholder",
+                "Leave empty to use the built-in default 4-layer prompt template (上下文 / 我需要什么 / 来判断什么 / 以便让我明确)."
+              )}
+            />
+          </div>
+        </div>
       )}
     </div>
   )

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest"
-import { collectResearchSources, makeDeepResearchFileName, noResearchSourcesTaskPatch } from "./deep-research"
+import {
+  collectResearchSources,
+  makeDeepResearchFileName,
+  noResearchSourcesTaskPatch,
+  type ResearchSourceError,
+} from "./deep-research"
 import type { SearchApiConfig } from "@/stores/wiki-store"
 import type { WebSearchResult } from "./web-search"
 
@@ -17,12 +22,29 @@ const localResult: WebSearchResult = {
   source: "AnyTXT",
 }
 
+const deepWikiResult: WebSearchResult = {
+  title: "DeepWiki: alpha",
+  url: "https://example.com/space/test-space",
+  snippet: "deepwiki long-form answer",
+  source: "DeepWiki",
+}
+
 function config(patch: Partial<SearchApiConfig>): SearchApiConfig {
   return {
     provider: "none",
     apiKey: "",
     ...patch,
   }
+}
+
+/** Build the deps with a default no-op DeepWiki mock so existing web/anytxt
+ * tests don't each have to repeat it. */
+function makeDeps(
+  web: ReturnType<typeof vi.fn>,
+  anytxt: ReturnType<typeof vi.fn>,
+  deepwiki: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue([]),
+) {
+  return { webSearch: web as never, anyTxtSearch: anytxt as never, deepWikiSearch: deepwiki as never }
 }
 
 describe("makeDeepResearchFileName", () => {
@@ -50,10 +72,14 @@ describe("makeDeepResearchFileName", () => {
 
 describe("noResearchSourcesTaskPatch", () => {
   it("marks source failures as an error instead of completed", () => {
-    expect(noResearchSourcesTaskPatch(["Firecrawl blocked this IP", "AnyTXT offline"])).toEqual({
+    const errors: ResearchSourceError[] = [
+      { source: "web", message: "Firecrawl blocked this IP" },
+      { source: "anytxt", message: "AnyTXT offline" },
+    ]
+    expect(noResearchSourcesTaskPatch(errors)).toEqual({
       status: "error",
       synthesis: "",
-      error: "Firecrawl blocked this IP\nAnyTXT offline",
+      error: "[web] Firecrawl blocked this IP\n[anytxt] AnyTXT offline",
     })
   })
 
@@ -73,9 +99,9 @@ describe("collectResearchSources", () => {
 
     const out = await collectResearchSources(
       ["alpha"],
-      config({ deepResearchSource: "web", provider: "tavily", apiKey: "tvly" }),
+      config({ deepResearchSources: ["web"], provider: "tavily", apiKey: "tvly" }),
       "/project",
-      { webSearch, anyTxtSearch },
+      makeDeps(webSearch, anyTxtSearch),
     )
 
     expect(webSearch).toHaveBeenCalledTimes(1)
@@ -90,13 +116,13 @@ describe("collectResearchSources", () => {
     const out = await collectResearchSources(
       ["alpha"],
       config({
-        deepResearchSource: "anytxt",
+        deepResearchSources: ["anytxt"],
         provider: "tavily",
         apiKey: "tvly",
         anyTxt: { endpoint: "http://127.0.0.1:9920" },
       }),
       "/project",
-      { webSearch, anyTxtSearch },
+      makeDeps(webSearch, anyTxtSearch),
     )
 
     expect(webSearch).not.toHaveBeenCalled()
@@ -113,13 +139,13 @@ describe("collectResearchSources", () => {
     const out = await collectResearchSources(
       ["alpha"],
       config({
-        deepResearchSource: "both",
+        deepResearchSources: ["web", "anytxt"],
         provider: "tavily",
         apiKey: "tvly",
         anyTxt: { endpoint: "http://127.0.0.1:9920" },
       }),
       "/project",
-      { webSearch, anyTxtSearch },
+      makeDeps(webSearch, anyTxtSearch),
     )
 
     expect(webSearch).toHaveBeenCalledTimes(1)
@@ -127,44 +153,104 @@ describe("collectResearchSources", () => {
     expect(out.results).toEqual([webResult, localResult])
   })
 
-  it("keeps web results when AnyTXT fails and exposes the source error", async () => {
+  it("keeps web results when AnyTXT fails and exposes the structured source error", async () => {
     const webSearch = vi.fn().mockResolvedValue([webResult])
     const anyTxtSearch = vi.fn().mockRejectedValue(new Error("Check that ATGUI.exe is running"))
 
     const out = await collectResearchSources(
       ["alpha"],
       config({
-        deepResearchSource: "both",
+        deepResearchSources: ["web", "anytxt"],
         provider: "tavily",
         apiKey: "tvly",
         anyTxt: { endpoint: "http://127.0.0.1:9920" },
       }),
       "/project",
-      { webSearch, anyTxtSearch },
+      makeDeps(webSearch, anyTxtSearch),
     )
 
     expect(out.results).toEqual([webResult])
-    expect(out.errors).toEqual(["Check that ATGUI.exe is running"])
+    expect(out.errors).toEqual([
+      { source: "anytxt", message: "Check that ATGUI.exe is running" },
+    ])
   })
 
-  it("skips Web Search in both mode when no web provider is configured", async () => {
+  it("treats a selected-but-unconfigured source as a failure, not a silent skip", async () => {
     const webSearch = vi.fn().mockResolvedValue([webResult])
     const anyTxtSearch = vi.fn().mockResolvedValue([localResult])
 
     const out = await collectResearchSources(
       ["alpha"],
       config({
-        deepResearchSource: "both",
-        provider: "none",
+        deepResearchSources: ["web", "anytxt"],
+        provider: "none", // web selected but not configured
         anyTxt: { endpoint: "http://127.0.0.1:9920" },
       }),
       "/project",
-      { webSearch, anyTxtSearch },
+      makeDeps(webSearch, anyTxtSearch),
     )
 
     expect(webSearch).not.toHaveBeenCalled()
     expect(anyTxtSearch).toHaveBeenCalledTimes(1)
     expect(out.results).toEqual([localResult])
+    expect(out.errors).toEqual([
+      { source: "web", message: "Web search provider not configured" },
+    ])
+  })
+
+  it("calls DeepWiki and appends its result past the 20-result cap", async () => {
+    // Web returns enough to hit the cap; DeepWiki must still appear.
+    const webSearch = vi.fn().mockResolvedValue(
+      Array.from({ length: 25 }, (_, index) => ({
+        title: `Result ${index}`,
+        url: `https://example.com/${index}`,
+        snippet: "snippet",
+        source: "example.com",
+      })),
+    )
+    const anyTxtSearch = vi.fn().mockResolvedValue([])
+    const deepWikiSearch = vi.fn().mockResolvedValue([deepWikiResult])
+
+    const out = await collectResearchSources(
+      ["alpha"],
+      config({
+        deepResearchSources: ["web", "deepwiki"],
+        provider: "tavily",
+        apiKey: "tvly",
+        deepWiki: { enabled: true, baseUrl: "https://example.com/api/open", spaceId: "test-space", model: "test-model", branch: "main", timeoutSecs: 600, maxSnippetChars: 4000 },
+      }),
+      "/project",
+      makeDeps(webSearch, anyTxtSearch, deepWikiSearch),
+      { llmConfig: { provider: "openai", apiKey: "k", model: "m", endpoint: "" } as never, context: { topic: "alpha", wikiIndex: "", purpose: "" } },
+    )
+
+    expect(deepWikiSearch).toHaveBeenCalledTimes(1)
+    expect(out.results).toHaveLength(21) // 20 capped web + 1 deepwiki bypass
+    expect(out.results[20]).toEqual(deepWikiResult)
+  })
+
+  it("records a structured error when DeepWiki is selected but unconfigured", async () => {
+    const webSearch = vi.fn().mockResolvedValue([webResult])
+    const anyTxtSearch = vi.fn().mockResolvedValue([localResult])
+    const deepWikiSearch = vi.fn().mockResolvedValue([deepWikiResult])
+
+    const out = await collectResearchSources(
+      ["alpha"],
+      config({
+        deepResearchSources: ["web", "deepwiki"],
+        provider: "tavily",
+        apiKey: "tvly",
+        deepWiki: { enabled: false, baseUrl: "" }, // not configured
+      }),
+      "/project",
+      makeDeps(webSearch, anyTxtSearch, deepWikiSearch),
+      { llmConfig: { provider: "openai", apiKey: "k", model: "m", endpoint: "" } as never, context: { topic: "alpha", wikiIndex: "", purpose: "" } },
+    )
+
+    expect(deepWikiSearch).not.toHaveBeenCalled()
+    expect(out.errors).toEqual([
+      { source: "deepwiki", message: "DeepWiki source not configured" },
+    ])
   })
 
   it("returns no results for blank queries", async () => {
@@ -173,9 +259,9 @@ describe("collectResearchSources", () => {
 
     const out = await collectResearchSources(
       [" ", ""],
-      config({ deepResearchSource: "both", provider: "tavily", apiKey: "tvly" }),
+      config({ deepResearchSources: ["web", "anytxt"], provider: "tavily", apiKey: "tvly" }),
       "/project",
-      { webSearch, anyTxtSearch },
+      makeDeps(webSearch, anyTxtSearch),
     )
 
     expect(webSearch).not.toHaveBeenCalled()
@@ -197,13 +283,34 @@ describe("collectResearchSources", () => {
 
     const out = await collectResearchSources(
       ["alpha", "beta"],
-      config({ deepResearchSource: "web", provider: "tavily", apiKey: "tvly" }),
+      config({ deepResearchSources: ["web"], provider: "tavily", apiKey: "tvly" }),
       "/project",
-      { webSearch, anyTxtSearch },
+      makeDeps(webSearch, anyTxtSearch),
     )
 
     expect(out.results).toHaveLength(20)
     expect(infoSpy).toHaveBeenCalledTimes(1)
     infoSpy.mockRestore()
+  })
+
+  it("migrates the legacy scalar deepResearchSource to the list model", async () => {
+    const webSearch = vi.fn().mockResolvedValue([webResult])
+    const anyTxtSearch = vi.fn().mockResolvedValue([localResult])
+
+    const out = await collectResearchSources(
+      ["alpha"],
+      config({
+        deepResearchSource: "both", // legacy scalar
+        provider: "tavily",
+        apiKey: "tvly",
+        anyTxt: { endpoint: "http://127.0.0.1:9920" },
+      }),
+      "/project",
+      makeDeps(webSearch, anyTxtSearch),
+    )
+
+    expect(webSearch).toHaveBeenCalledTimes(1)
+    expect(anyTxtSearch).toHaveBeenCalledTimes(1)
+    expect(out.results).toEqual([webResult, localResult])
   })
 })
