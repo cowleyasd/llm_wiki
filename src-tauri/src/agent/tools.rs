@@ -18,6 +18,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{timeout, Duration};
 use walkdir::WalkDir;
 
+use crate::commands::path_validation::validate_portable_path_segment as validate_portable_path_segment_raw;
+
 use crate::commands::external_search::file_url_for_path;
 use crate::commands::search::{self, SearchEmbeddingConfig};
 
@@ -2520,62 +2522,13 @@ fn normalize_workspace_write_path(path: &str) -> Result<String, String> {
 }
 
 fn validate_workspace_path_segment(segment: &str) -> Result<(), String> {
-    validate_portable_path_segment(segment)
-        .map_err(|err| err.replace("wiki.write_page", "workspace.write_file"))
+    validate_portable_path_segment_raw(segment)
+        .map_err(|err| err.workspace_write_file_message())
 }
 
 fn validate_portable_path_segment(segment: &str) -> Result<(), String> {
-    if segment.is_empty() {
-        return Err("wiki.write_page path contains an empty segment".to_string());
-    }
-    if segment.ends_with([' ', '.']) {
-        return Err(
-            "wiki.write_page path contains a segment ending with a space or dot, which is not portable to Windows"
-                .to_string(),
-        );
-    }
-    if segment
-        .chars()
-        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*') || ch <= '\u{1f}')
-    {
-        return Err(
-            "wiki.write_page path contains characters that are invalid on Windows".to_string(),
-        );
-    }
-    let stem = segment
-        .split('.')
-        .next()
-        .unwrap_or(segment)
-        .trim_end_matches(' ')
-        .to_ascii_uppercase();
-    if matches!(
-        stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-    ) {
-        return Err("wiki.write_page path uses a Windows reserved device name".to_string());
-    }
-    Ok(())
+    validate_portable_path_segment_raw(segment)
+        .map_err(|err| err.wiki_write_page_message().to_string())
 }
 
 fn extract_markdown_title(content: &str) -> Option<String> {
@@ -3499,5 +3452,34 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].path, "/docs/value.txt");
         assert_eq!(items[0].snippet, "from value");
+    }
+
+    // Regression: lock the user-facing error wording for path validation so
+    // the extraction to `commands::path_validation` does not silently change
+    // what `wiki.write_page` / `workspace.write_file` surface to the agent.
+    #[test]
+    fn wiki_write_path_errors_keep_wording() {
+        let err = normalize_wiki_write_path("wiki/").unwrap_err();
+        assert!(err.contains("wiki.write_page"), "{err}");
+        let err = normalize_wiki_write_path("wiki//a.md").unwrap_err();
+        assert_eq!(err, "wiki.write_page path contains an empty segment");
+        let err = normalize_wiki_write_path("wiki/ab./c.md").unwrap_err();
+        assert!(err.contains("ending with a space or dot"));
+        let err = normalize_wiki_write_path("wiki/a:b.md").unwrap_err();
+        assert!(err.contains("invalid on Windows"));
+        let err = normalize_wiki_write_path("wiki/CON.md").unwrap_err();
+        assert!(err.contains("Windows reserved device name"));
+    }
+
+    #[test]
+    fn workspace_write_path_errors_keep_wording() {
+        let err = normalize_workspace_write_path("a//b.txt").unwrap_err();
+        assert_eq!(err, "workspace.write_file path contains an empty segment");
+        let err = normalize_workspace_write_path("ab./c.txt").unwrap_err();
+        assert!(err.contains("ending with a space or dot"));
+        let err = normalize_workspace_write_path("a:b.txt").unwrap_err();
+        assert!(err.contains("invalid on Windows"));
+        let err = normalize_workspace_write_path("CON.txt").unwrap_err();
+        assert!(err.contains("Windows reserved device name"));
     }
 }

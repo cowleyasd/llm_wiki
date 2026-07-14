@@ -296,6 +296,22 @@ export class LlmWikiApiClient {
     })
   }
 
+  /**
+   * Drop a text document into the project's `raw/sources/` and trigger the
+   * file-sync → ingest pipeline. Returns the stored path and an
+   * `ingestTrigger` status (see the desktop app's drop endpoint).
+   */
+  async dropSource(
+    projectId: string,
+    name: string,
+    content: string,
+  ): Promise<Record<string, unknown>> {
+    return this.request(`/projects/${encodeURIComponent(projectId)}/sources/drop`, {
+      method: "POST",
+      body: { name, content },
+    })
+  }
+
   private async request(path: string, options: { method?: "GET" | "POST"; body?: unknown; auth?: boolean } = {}): Promise<Record<string, unknown>> {
     const url = `${this.baseUrl}${apiPath(path)}`
     const headers: Record<string, string> = { Accept: "application/json" }

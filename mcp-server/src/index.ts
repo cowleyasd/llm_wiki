@@ -154,6 +154,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         additionalProperties: false,
       },
     },
+    {
+      name: "llm_wiki_drop_source",
+      description: [
+        "Drop a text document into a project's raw/sources/ and trigger automatic ingestion into the wiki.",
+        "",
+        "Prerequisites for ingestion to actually run: the desktop app is running, the target project is currently open, Source Watch is enabled with auto-ingest on, and the file is not excluded by the watch rules.",
+        "",
+        "The returned `ingestTrigger` field reports the trigger status:",
+        "- `accepted`: file saved and rescan completed (change event emitted). Does NOT guarantee the listener was online or that ingestion finished — poll llm_wiki_files / llm_wiki_search to verify the resulting wiki pages.",
+        "- `notEligible`: file saved, but source-watch is disabled / auto-ingest off / path excluded / over max size.",
+        "- `notCurrentProject`: file saved, but the project is not the currently-open one.",
+        "- `rescanFailed`: file saved, but rescan failed. Do NOT transparently retry — the file already exists on disk; retrying would create a duplicate source.",
+        "",
+        "At-least-once semantics: if the response is lost (network, timeout, client retry), re-sending the same content creates a NEW source file (with a timestamped name) and re-runs ingestion, producing duplicate wiki content and extra LLM cost. The caller is responsible for deduplication.",
+      ].join("\n"),
+      inputSchema: {
+        type: "object",
+        properties: {
+          project_id: { type: "string", description: "Project UUID, project path, or 'current'. Defaults to current." },
+          name: { type: "string", description: "Source file name (single path segment, no slashes). Saved as raw/sources/<name>.md. Must be a portable filename (no reserved Windows names, no trailing space/dot, no < > : \" | ? *)." },
+          content: { type: "string", description: "The full text content of the source document (UTF-8)." },
+        },
+        required: ["name", "content"],
+        additionalProperties: false,
+      },
+    },
   ],
 }))
 
@@ -233,6 +259,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "llm_wiki_rescan_sources": {
         await assertMcpEnabled()
         return textResult(JSON.stringify(await client.rescan(projectId(args)), null, 2))
+      }
+      case "llm_wiki_drop_source": {
+        await assertMcpEnabled()
+        const name = stringArg(args.name, "name")
+        const content = stringArg(args.content, "content")
+        return textResult(
+          JSON.stringify(await client.dropSource(projectId(args), name, content), null, 2),
+        )
       }
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${request.params.name}`)

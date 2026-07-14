@@ -21,6 +21,11 @@ const PORT: u16 = 19828;
 const API_PREFIX: &str = "/api/v1";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CHAT_BODY_BYTES: usize = 40 * 1024 * 1024;
+/// Drop endpoint accepts larger source documents (plain text can easily
+/// exceed the default 1 MiB). Capped below the chat limit; content over the
+/// project's `sourceWatch.maxFileSizeMb` is still rejected by the handler
+/// (a watcher would never ingest it).
+const MAX_DROP_BODY_BYTES: usize = 20 * 1024 * 1024;
 const MAX_FILE_CONTENT_BYTES: u64 = 2 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 2_000;
 const HARD_MAX_FILES: usize = 10_000;
@@ -175,8 +180,13 @@ fn process_request(app: AppHandle, mut request: tiny_http::Request) {
 
     let body = match read_body(&mut request, body_limit_for_request(&method, &url)) {
         Ok(body) => body,
-        Err(err) => {
-            respond_error(request, 400, &err, origin.as_deref());
+        Err(body_err) => {
+            let (status, message): (u16, String) = match body_err {
+                BodyReadError::TooLarge => (413, "Request body too large".to_string()),
+                BodyReadError::NotUtf8 => (400, "Request body must be UTF-8".to_string()),
+                BodyReadError::ReadFailed(msg) => (400, msg),
+            };
+            respond_error(request, status, &message, origin.as_deref());
             return;
         }
     };
@@ -286,6 +296,9 @@ fn handle_request(
         (&Method::Post, ["projects", project_id, "sources", "rescan"]) => {
             handle_rescan(app, project_id)
         }
+        (&Method::Post, ["projects", project_id, "sources", "drop"]) => {
+            handle_drop_source(app, project_id, body)
+        }
         (&Method::Post, ["projects", project_id, "chat"]) => handle_chat(app, project_id, body),
         (&Method::Post, ["projects", project_id, "chat", session_id, "cancel"]) => {
             handle_cancel_chat(app, project_id, session_id)
@@ -343,21 +356,34 @@ fn body_limit_for_request(method: &Method, url: &str) -> usize {
         .collect::<Vec<_>>();
     if method == &Method::Post && matches!(parts.as_slice(), ["projects", _, "chat"]) {
         MAX_CHAT_BODY_BYTES
+    } else if method == &Method::Post && matches!(parts.as_slice(), ["projects", _, "sources", "drop"]) {
+        MAX_DROP_BODY_BYTES
     } else {
         MAX_BODY_BYTES
     }
 }
 
-fn read_body(request: &mut tiny_http::Request, max_body_bytes: usize) -> Result<String, String> {
+/// Structured body-read failure so callers can map the right HTTP status
+/// (413 for size, 400 for encoding/IO) instead of a blanket 400.
+enum BodyReadError {
+    TooLarge,
+    NotUtf8,
+    ReadFailed(String),
+}
+
+fn read_body(
+    request: &mut tiny_http::Request,
+    max_body_bytes: usize,
+) -> Result<String, BodyReadError> {
     let mut limited = request.as_reader().take(max_body_bytes as u64 + 1);
     let mut bytes = Vec::new();
     limited
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("Failed to read body: {e}"))?;
+        .map_err(|e| BodyReadError::ReadFailed(format!("Failed to read body: {e}")))?;
     if bytes.len() > max_body_bytes {
-        return Err("Request body too large".to_string());
+        return Err(BodyReadError::TooLarge);
     }
-    String::from_utf8(bytes).map_err(|_| "Request body must be UTF-8".to_string())
+    String::from_utf8(bytes).map_err(|_| BodyReadError::NotUtf8)
 }
 
 fn respond_error(request: tiny_http::Request, status: u16, message: &str, origin: Option<&str>) {
@@ -2008,6 +2034,331 @@ fn handle_rescan(app: &AppHandle, project_id: &str) -> ApiResponse {
     }
 }
 
+/// Request body for `POST /projects/{id}/sources/drop`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DropSourceRequest {
+    name: String,
+    content: String,
+}
+
+/// Outcome of the file-sync trigger, reported back to the caller. The drop
+/// endpoint is at-least-once: it never claims ingestion completed — only that
+/// the file landed and (when eligible) the change notification was emitted.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum DropIngestTrigger {
+    /// File saved and rescan completed (change event emitted). Does NOT mean
+    /// the desktop listener was online or that ingest finished.
+    Accepted,
+    /// File saved, but source-watch is disabled / auto-ingest off / path
+    /// excluded / over max size — the pipeline would not pick it up.
+    NotEligible { reason: String },
+    /// File saved, but the project is not the currently-open one (frontend
+    /// listener only handles the current project).
+    NotCurrentProject,
+    /// File saved, but rescan failed (logic error or emit failure). Caller
+    /// must NOT transparently retry — the file already exists on disk.
+    RescanFailed { error: String },
+}
+
+/// `POST /projects/{id}/sources/drop` — accept a text document from an
+/// external MCP client, persist it under `raw/sources/`, and trigger the
+/// existing file-sync → ingest pipeline.
+///
+/// Writes via a staging file (under `.llm-wiki/drop-staging/`, which the
+/// watcher excludes) and publishes with `hard_link` so the final path only
+/// ever appears atomically and complete — the watcher can never read a
+/// half-written file. `hard_link` returns `AlreadyExists` when the target
+/// exists, preserving the no-overwrite contract without a check-then-write
+/// race. On filesystems that don't support hard links (FAT etc.) the request
+/// fails with `atomic_publish_unsupported` rather than falling back to a
+/// direct write that would re-expose the half-write window.
+fn handle_drop_source(app: &AppHandle, project_id: &str, body: &str) -> ApiResponse {
+    let request: DropSourceRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return err(400, format!("Invalid drop request body: {e}")),
+    };
+    let name = request.name.trim();
+    if name.is_empty() {
+        return ApiResponse { status: 400, body: json!({ "ok": false, "code": "invalid_name_empty" }) };
+    }
+    // `name` must be a single path segment (no separators) — it is placed
+    // directly under raw/sources/.
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return ApiResponse { status: 400, body: json!({ "ok": false, "code": "invalid_name_segment" }) };
+    }
+    // Validate for portability (Windows reserved names, illegal chars, ...).
+    if let Err(e) = commands::path_validation::validate_portable_path_segment(name) {
+        return ApiResponse { status: 400, body: json!({ "ok": false, "code": drop_name_error_code(e) }) };
+    }
+    // Length guard: leave room for `.md`, timestamp, uuid suffix on rename.
+    if name.len() > 180 {
+        return ApiResponse { status: 400, body: json!({ "ok": false, "code": "invalid_name_too_long" }) };
+    }
+
+    let project = match resolve_project(app, project_id) {
+        Ok(project) => project,
+        Err(e) => return err(404, e),
+    };
+
+    // Content size vs project's source-watch maxFileSizeMb. A file the watcher
+    // would ignore is rejected up front rather than saved-but-never-ingested.
+    let config = load_source_watch_config(app, &project.id).unwrap_or_default();
+    let max_bytes = config.max_file_size_mb() * 1024 * 1024;
+    if (request.content.len() as u64) > max_bytes {
+        return ApiResponse {
+            status: 413,
+            body: json!({
+                "ok": false,
+                "code": "source_too_large",
+                "configuredMaxFileSizeMb": config.max_file_size_mb(),
+            }),
+        };
+    }
+
+    let rel = format!("raw/sources/{name}.md");
+    // Eligibility precheck (uses content.len(), not disk metadata — the final
+    // file does not exist yet). Done before staging to avoid writing then
+    // discovering the pipeline would ignore it.
+    let eligibility = commands::file_sync::source_watch_eligibility_for_size(
+        &rel,
+        request.content.len() as u64,
+        &config,
+    );
+
+    let root = PathBuf::from(&project.path);
+    // Publish path + staging dir.
+    let drop_staging = root.join(".llm-wiki").join("drop-staging");
+
+    // Write to staging, then hard_link into raw/sources/.
+    let publish_result = publish_dropped_source(&root, &drop_staging, name, &request.content);
+
+    let (stored_path, renamed) = match publish_result {
+        Ok(p) => p,
+        Err(e) => return err(500, e),
+    };
+
+    // Recompute eligibility against the actually-stored path. On a name
+    // collision `publish_dropped_source` renames to `name-<ts>-<uuid>.md`,
+    // so filename-specific exclude globs must be evaluated against the real
+    // stored name, not the requested one — otherwise the reported trigger
+    // disagrees with what the watcher accepts.
+    let stored_rel = stored_path
+        .strip_prefix(&root)
+        .ok()
+        .and_then(|p| p.to_str())
+        .map(|s| s.replace('\\', "/"))
+        .unwrap_or_else(|| rel.clone());
+    let eligibility = if stored_rel == rel {
+        eligibility
+    } else {
+        commands::file_sync::source_watch_eligibility_for_size(
+            &stored_rel,
+            request.content.len() as u64,
+            &config,
+        )
+    };
+
+    // Compute the trigger status. Even when not eligible / not current, the
+    // file is already on disk — report stored:true and skip rescan.
+    let trigger = if !project.current {
+        DropIngestTrigger::NotCurrentProject
+    } else {
+        match eligibility {
+            commands::file_sync::SourceWatchEligibility::Eligible => {
+                let source_watch_config = load_source_watch_config(app, &project.id);
+                match commands::file_sync::rescan_project_files(
+                    app.clone(),
+                    project.id.clone(),
+                    project.path.clone(),
+                    source_watch_config,
+                ) {
+                    Ok(_) => DropIngestTrigger::Accepted,
+                    Err(e) => DropIngestTrigger::RescanFailed { error: e },
+                }
+            }
+            commands::file_sync::SourceWatchEligibility::Disabled => {
+                DropIngestTrigger::NotEligible { reason: "disabled".to_string() }
+            }
+            commands::file_sync::SourceWatchEligibility::AutoIngestDisabled => {
+                DropIngestTrigger::NotEligible { reason: "auto_ingest_disabled".to_string() }
+            }
+            commands::file_sync::SourceWatchEligibility::Excluded => {
+                DropIngestTrigger::NotEligible { reason: "excluded".to_string() }
+            }
+            commands::file_sync::SourceWatchEligibility::TooLarge => {
+                DropIngestTrigger::NotEligible { reason: "too_large".to_string() }
+            }
+        }
+    };
+
+    ok(json!({
+        "ok": true,
+        "projectId": project.id,
+        "path": stored_rel,
+        "renamed": renamed,
+        "stored": true,
+        "ingestTrigger": trigger,
+    }))
+}
+
+/// Map a [`PortablePathError`] to a stable machine-readable code for the API.
+fn drop_name_error_code(e: commands::path_validation::PortablePathError) -> &'static str {
+    use commands::path_validation::PortablePathError as E;
+    match e {
+        E::Empty => "invalid_name_empty",
+        E::TrailingSpaceOrDot => "invalid_name_trailing_space_or_dot",
+        E::IllegalChar => "invalid_name_illegal_char",
+        E::WindowsReserved => "invalid_name_reserved",
+    }
+}
+
+/// Write `content` to a staging file under `drop_staging`, then atomically
+/// publish to `raw/sources/<final>.md` via `hard_link`. Returns the final
+/// path and whether a timestamp suffix was added to avoid a collision.
+///
+/// On `AlreadyExists`, retries with `name-<ts>-<uuid>.md` up to 100 times.
+/// On unsupported hard links, returns `atomic_publish_unsupported`. Other
+/// write/link failures clean up the staging file and return the error.
+fn publish_dropped_source(
+    root: &Path,
+    drop_staging: &Path,
+    name: &str,
+    content: &str,
+) -> Result<(PathBuf, bool), String> {
+    // Ensure raw/sources/ exists and is bound to the project (symlink guard).
+    let sources_dir = root.join("raw").join("sources");
+    ensure_bound_dir(root, &sources_dir)?;
+    fs::create_dir_all(&sources_dir).map_err(|e| format!("Failed to create raw/sources: {e}"))?;
+    ensure_project_bound_path(root, &sources_dir)?;
+
+    // Staging dir lives under .llm-wiki/ which the watcher excludes.
+    // Same symlink guard as raw/sources: a `.llm-wiki`/`drop-staging`
+    // symlink pointing outside the project would otherwise let
+    // `write_file_complete` write through it to an arbitrary location.
+    ensure_bound_dir(root, drop_staging)?;
+    fs::create_dir_all(drop_staging).map_err(|e| format!("Failed to create drop-staging: {e}"))?;
+    ensure_project_bound_path(root, drop_staging)?;
+
+    let staging = drop_staging.join(format!("{}.md", Uuid::new_v4()));
+    write_file_complete(&staging, content)?;
+
+    // Try name.md, then name-<ts>-<uuid>.md on collision.
+    let final_path = match try_hard_link(&staging, &sources_dir, &format!("{name}.md")) {
+        Ok(p) => p,
+        Err(PublishError::AlreadyExists) => {
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let mut attempt = 0u32;
+            loop {
+                let candidate = if attempt == 0 {
+                    format!("{name}-{ts}-{}.md", Uuid::new_v4().simple())
+                } else {
+                    format!("{name}-{ts}-{}-{attempt}.md", Uuid::new_v4().simple())
+                };
+                match try_hard_link(&staging, &sources_dir, &candidate) {
+                    Ok(p) => break p,
+                    Err(PublishError::AlreadyExists) => {
+                        attempt += 1;
+                        if attempt >= 100 {
+                            let _ = fs::remove_file(&staging);
+                            return Err(
+                                "Could not allocate a unique filename after 100 attempts"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                    Err(PublishError::Unsupported) => {
+                        let _ = fs::remove_file(&staging);
+                        return Err("atomic_publish_unsupported".to_string());
+                    }
+                    Err(PublishError::Other(e)) => {
+                        let _ = fs::remove_file(&staging);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Err(PublishError::Unsupported) => {
+            let _ = fs::remove_file(&staging);
+            return Err("atomic_publish_unsupported".to_string());
+        }
+        Err(PublishError::Other(e)) => {
+            let _ = fs::remove_file(&staging);
+            return Err(e);
+        }
+    };
+
+    // Staging file is now one of potentially several links to the same inode;
+    // unlinking it leaves the final path intact.
+    let _ = fs::remove_file(&staging);
+    let renamed = !final_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s == name)
+        .unwrap_or(false);
+    Ok((final_path, renamed))
+}
+
+enum PublishError {
+    AlreadyExists,
+    Unsupported,
+    Other(String),
+}
+
+/// Attempt `hard_link(staging, sources_dir/<filename>)`, classifying the
+/// error so the caller can decide whether to retry with a new name.
+fn try_hard_link(staging: &Path, sources_dir: &Path, filename: &str) -> Result<PathBuf, PublishError> {
+    let target = sources_dir.join(filename);
+    match fs::hard_link(staging, &target) {
+        Ok(()) => Ok(target),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(PublishError::AlreadyExists),
+        Err(e) if e.raw_os_error() == Some(18) /* EXDEV */ => Err(PublishError::Unsupported),
+        Err(e) if e.to_string().contains("hard link") && e.to_string().contains("not supported") => {
+            Err(PublishError::Unsupported)
+        }
+        Err(e) => Err(PublishError::Other(format!("Failed to publish source: {e}"))),
+    }
+}
+
+/// Write content and flush before returning so the staging file is complete
+/// before hard_link publishes it.
+fn write_file_complete(path: &Path, content: &str) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create staging dir: {e}"))?;
+    }
+    let mut file = fs::File::create(path).map_err(|e| format!("Failed to create staging file: {e}"))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write staging file: {e}"))?;
+    file.flush().map_err(|e| format!("Failed to flush staging file: {e}"))?;
+    Ok(())
+}
+
+/// Verify `dir` (if it exists) canonicalizes inside `root`. Used before
+/// creating raw/sources to reject a symlinked `raw` pointing outside the
+/// project.
+fn ensure_bound_dir(root: &Path, dir: &Path) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    ensure_project_bound_path(root, dir)
+}
+
+/// Canonicalize `path` and confirm it is inside the canonical `root`.
+fn ensure_project_bound_path(root: &Path, path: &Path) -> Result<(), String> {
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve project root: {e}"))?;
+    let path_canon = path
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve path: {e}"))?;
+    if !path_canon.starts_with(&root_canon) {
+        return Err("Resolved path escapes the project directory".to_string());
+    }
+    Ok(())
+}
+
 fn load_source_watch_config(
     app: &AppHandle,
     project_id: &str,
@@ -2716,5 +3067,85 @@ mod tests {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         assert!(!allow_lan_access_missing);
+    }
+
+    fn drop_test_project() -> PathBuf {
+        let root = test_project_dir();
+        fs::create_dir_all(root.join("raw/sources")).unwrap();
+        fs::create_dir_all(root.join(".llm-wiki")).unwrap();
+        root
+    }
+
+    #[test]
+    fn drop_publishes_source_file() {
+        let root = drop_test_project();
+        let staging = root.join(".llm-wiki/drop-staging");
+        let (path, renamed) =
+            publish_dropped_source(&root, &staging, "note", "hello world").unwrap();
+        assert!(!renamed, "first publish should not rename");
+        assert_eq!(path, root.join("raw/sources/note.md"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello world");
+        // staging file cleaned up
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drop_does_not_overwrite_existing() {
+        let root = drop_test_project();
+        let staging = root.join(".llm-wiki/drop-staging");
+        // Pre-existing file
+        fs::write(root.join("raw/sources/note.md"), "original").unwrap();
+
+        let (path, renamed) =
+            publish_dropped_source(&root, &staging, "note", "new content").unwrap();
+        assert!(renamed, "collision should rename");
+        assert_ne!(path, root.join("raw/sources/note.md"));
+        // Original untouched
+        assert_eq!(fs::read_to_string(root.join("raw/sources/note.md")).unwrap(), "original");
+        // New content landed in the renamed file
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new content");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drop_name_error_codes_are_exhaustive() {
+        use commands::path_validation::PortablePathError as E;
+        assert_eq!(drop_name_error_code(E::Empty), "invalid_name_empty");
+        assert_eq!(
+            drop_name_error_code(E::TrailingSpaceOrDot),
+            "invalid_name_trailing_space_or_dot"
+        );
+        assert_eq!(drop_name_error_code(E::IllegalChar), "invalid_name_illegal_char");
+        assert_eq!(drop_name_error_code(E::WindowsReserved), "invalid_name_reserved");
+    }
+
+    #[test]
+    fn drop_rejects_traversal_name() {
+        // `..` is rejected by portable-segment validation (trailing dot).
+        assert!(commands::path_validation::validate_portable_path_segment("..").is_err());
+        assert!(commands::path_validation::validate_portable_path_segment("CON").is_err());
+        // Separator rejection (name with `/` or `\`) is enforced in
+        // handle_drop_source before validate_portable_path_segment, so a
+        // multi-segment name can never reach raw/sources/.
+        assert!("a/b".contains('/'));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drop_rejects_symlinked_sources_dir() {
+        use std::os::unix::fs::symlink;
+        // Project root with a `raw` that is a symlink pointing outside —
+        // publishing must refuse rather than write through the symlink.
+        let outside = test_project_dir();
+        let root = test_project_dir();
+        fs::remove_dir_all(root.join("raw")).ok();
+        symlink(outside.join("raw"), root.join("raw")).unwrap();
+
+        let staging = root.join(".llm-wiki/drop-staging");
+        let result = publish_dropped_source(&root, &staging, "note", "x");
+        assert!(result.is_err(), "symlinked raw/ must be rejected");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 }

@@ -137,6 +137,13 @@ impl Default for SourceWatchConfig {
     }
 }
 
+impl SourceWatchConfig {
+    /// Max source file size in MiB (read accessor for cross-module callers).
+    pub(crate) fn max_file_size_mb(&self) -> u64 {
+        self.max_file_size_mb
+    }
+}
+
 fn default_source_watch_config() -> SourceWatchConfig {
     SourceWatchConfig::default()
 }
@@ -823,7 +830,7 @@ fn process_queue_inner(
     root: &Path,
     project_id: &str,
     mut on_queue: impl FnMut(&FileChangeQueue),
-    mut on_changed: impl FnMut(Vec<FileChangeTask>),
+    mut on_changed: impl FnMut(Vec<FileChangeTask>) -> Result<(), String>,
 ) -> Result<Vec<FileChangeTask>, String> {
     let mut changed_tasks = Vec::<FileChangeTask>::new();
     let mut all_changed_tasks = Vec::<FileChangeTask>::new();
@@ -847,7 +854,7 @@ fn process_queue_inner(
         let picked = match pick_result {
             Ok(result) => result,
             Err(err) => {
-                on_changed(changed_tasks);
+                on_changed(changed_tasks)?;
                 return Err(err);
             }
         };
@@ -855,11 +862,11 @@ fn process_queue_inner(
             let queue = match with_queue_lock(root, || read_queue(root)) {
                 Ok(queue) => queue,
                 Err(err) => {
-                    on_changed(changed_tasks);
+                    let _ = on_changed(changed_tasks);
                     return Err(err);
                 }
             };
-            on_changed(changed_tasks);
+            on_changed(changed_tasks)?;
             on_queue(&queue);
             return Ok(all_changed_tasks);
         };
@@ -918,7 +925,7 @@ fn process_queue_inner(
         let queue = match update_result {
             Ok(queue) => queue,
             Err(err) => {
-                on_changed(changed_tasks);
+                on_changed(changed_tasks)?;
                 return Err(err);
             }
         };
@@ -1125,6 +1132,80 @@ struct SourceWatchRules<'a> {
     exclude_globs: Vec<String>,
 }
 
+/// Why a candidate source path would (or would not) be picked up by the
+/// file-sync → ingest pipeline. Shared between the watcher and the HTTP drop
+/// endpoint so they never drift on filtering rules.
+///
+/// Ordered from cheapest gate to most specific: a path that is disabled at
+/// the top level reports `Disabled` even if it would also be `Excluded`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceWatchEligibility {
+    Eligible,
+    Disabled,
+    AutoIngestDisabled,
+    Excluded,
+    TooLarge,
+}
+
+/// Evaluate eligibility for a path that does not exist yet (the HTTP drop
+/// endpoint writes via staging, so the final file is absent at decision time).
+/// `size_bytes` is the content length in bytes (`String::len` for UTF-8,
+/// matching what `write_all` will persist).
+pub(crate) fn source_watch_eligibility_for_size(
+    rel: &str,
+    size_bytes: u64,
+    config: &SourceWatchConfig,
+) -> SourceWatchEligibility {
+    if !config.enabled {
+        return SourceWatchEligibility::Disabled;
+    }
+    if !config.auto_ingest {
+        return SourceWatchEligibility::AutoIngestDisabled;
+    }
+    let rules = SourceWatchRules::new(config);
+    if !should_watch_rel(rel, &rules) {
+        return SourceWatchEligibility::Excluded;
+    }
+    if rel.starts_with("raw/sources/") {
+        let max_bytes = config.max_file_size_mb.saturating_mul(1024 * 1024);
+        if size_bytes > max_bytes {
+            return SourceWatchEligibility::TooLarge;
+        }
+    }
+    SourceWatchEligibility::Eligible
+}
+
+/// Evaluate eligibility for a path that already exists on disk (the watcher
+/// path). Reads metadata for the size check.
+#[allow(dead_code)]
+pub(crate) fn source_watch_eligibility_for_path(
+    root: &Path,
+    path: &Path,
+    config: &SourceWatchConfig,
+) -> SourceWatchEligibility {
+    if !config.enabled {
+        return SourceWatchEligibility::Disabled;
+    }
+    if !config.auto_ingest {
+        return SourceWatchEligibility::AutoIngestDisabled;
+    }
+    let rules = SourceWatchRules::new(config);
+    let Some(rel) = path.strip_prefix(root).ok().and_then(normalize_rel_path) else {
+        return SourceWatchEligibility::Excluded;
+    };
+    if !should_watch_rel(&rel, &rules) {
+        return SourceWatchEligibility::Excluded;
+    }
+    if rel.starts_with("raw/sources/")
+        && path.exists()
+        && fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+            > config.max_file_size_mb.saturating_mul(1024 * 1024)
+    {
+        return SourceWatchEligibility::TooLarge;
+    }
+    SourceWatchEligibility::Eligible
+}
+
 impl<'a> SourceWatchRules<'a> {
     fn new(config: &'a SourceWatchConfig) -> Self {
         Self {
@@ -1231,15 +1312,20 @@ fn emit_queue(app: &AppHandle, project_id: &str, queue: &FileChangeQueue) {
     let _ = app.emit(EVENT_QUEUE_UPDATED, payload);
 }
 
-fn emit_changed_batch(app: &AppHandle, project_id: &str, tasks: Vec<FileChangeTask>) {
+fn emit_changed_batch(
+    app: &AppHandle,
+    project_id: &str,
+    tasks: Vec<FileChangeTask>,
+) -> Result<(), String> {
     if tasks.is_empty() {
-        return;
+        return Ok(());
     }
     let payload = FileSyncPayload {
         project_id: project_id.to_string(),
         tasks,
     };
-    let _ = app.emit(EVENT_CHANGED, payload);
+    app.emit(EVENT_CHANGED, payload)
+        .map_err(|e| format!("Failed to emit {EVENT_CHANGED}: {e}"))
 }
 
 fn ensure_sync_dir(root: &Path) -> Result<(), String> {
@@ -1829,6 +1915,7 @@ mod tests {
                 if !tasks.is_empty() {
                     changed_emits += 1;
                 }
+                Ok(())
             },
         )
         .unwrap();
@@ -1869,12 +1956,90 @@ mod tests {
                     fs::create_dir_all(&snapshot_path).unwrap();
                 }
             },
-            |tasks| changed_count += tasks.len(),
+            |tasks| {
+                changed_count += tasks.len();
+                Ok(())
+            },
         );
 
         assert!(result.is_err());
         assert_eq!(changed_count, QUEUE_EMIT_EVERY);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    fn eligible_config() -> SourceWatchConfig {
+        SourceWatchConfig {
+            enabled: true,
+            auto_ingest: true,
+            ..SourceWatchConfig::default()
+        }
+    }
+
+    #[test]
+    fn eligibility_for_size_accepts_normal_source() {
+        let cfg = eligible_config();
+        assert_eq!(
+            source_watch_eligibility_for_size("raw/sources/note.md", 100, &cfg),
+            SourceWatchEligibility::Eligible
+        );
+    }
+
+    #[test]
+    fn eligibility_for_size_reports_disabled_first() {
+        let cfg = SourceWatchConfig {
+            enabled: false,
+            auto_ingest: false,
+            ..SourceWatchConfig::default()
+        };
+        // even though path is also excluded-less, disabled wins
+        assert_eq!(
+            source_watch_eligibility_for_size("raw/sources/note.md", 100, &cfg),
+            SourceWatchEligibility::Disabled
+        );
+    }
+
+    #[test]
+    fn eligibility_for_size_reports_auto_ingest_disabled() {
+        let cfg = SourceWatchConfig {
+            enabled: true,
+            auto_ingest: false,
+            ..SourceWatchConfig::default()
+        };
+        assert_eq!(
+            source_watch_eligibility_for_size("raw/sources/note.md", 100, &cfg),
+            SourceWatchEligibility::AutoIngestDisabled
+        );
+    }
+
+    #[test]
+    fn eligibility_for_size_reports_excluded() {
+        let cfg = SourceWatchConfig {
+            exclude_extensions: vec!["md".to_string()],
+            ..eligible_config()
+        };
+        assert_eq!(
+            source_watch_eligibility_for_size("raw/sources/note.md", 100, &cfg),
+            SourceWatchEligibility::Excluded
+        );
+        // non-source, non-wiki path is excluded
+        assert_eq!(
+            source_watch_eligibility_for_size("random/file.txt", 100, &eligible_config()),
+            SourceWatchEligibility::Excluded
+        );
+    }
+
+    #[test]
+    fn eligibility_for_size_reports_too_large() {
+        let cfg = eligible_config(); // default maxFileSizeMb
+        let max_bytes = cfg.max_file_size_mb * 1024 * 1024;
+        assert_eq!(
+            source_watch_eligibility_for_size("raw/sources/big.md", max_bytes + 1, &cfg),
+            SourceWatchEligibility::TooLarge
+        );
+        assert_eq!(
+            source_watch_eligibility_for_size("raw/sources/ok.md", max_bytes, &cfg),
+            SourceWatchEligibility::Eligible
+        );
     }
 }
