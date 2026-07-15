@@ -9,6 +9,7 @@ import type {
 } from "@/stores/wiki-store"
 import { hasConfiguredAnyTxt, normalizeAnyTxtConfig } from "@/lib/anytxt-search"
 import { hasConfiguredDeepWiki, normalizeDeepWikiConfig } from "@/lib/deepwiki-source"
+import { normalizeMcpServiceConfigs } from "@/lib/mcp-source"
 
 export interface WebSearchResult {
   title: string
@@ -52,7 +53,7 @@ export const SEARXNG_CATEGORY_OPTIONS: { value: SearXngCategory; label: string; 
 function migrateDeepResearchSources(config: SearchApiConfig): DeepResearchSourceId[] {
   const arr = config.deepResearchSources
   if (Array.isArray(arr) && arr.length > 0) {
-    return arr.filter((s): s is DeepResearchSourceId => s === "web" || s === "anytxt" || s === "deepwiki")
+    return arr.filter((s): s is DeepResearchSourceId => s === "web" || s === "anytxt" || s === "deepwiki" || s === "mcpServices")
   }
   const legacy = config.deepResearchSource
   if (legacy === "web") return ["web"]
@@ -111,6 +112,7 @@ export function resolveSearchConfig(config: SearchApiConfig): SearchApiConfig {
       deepResearchSource: undefined,
       anyTxt: normalizeAnyTxtConfig(config.anyTxt),
       deepWiki: normalizeDeepWikiConfig(config.deepWiki),
+      mcpServices: normalizeMcpServiceConfigs(config.mcpServices),
     }
   }
 
@@ -127,6 +129,7 @@ export function resolveSearchConfig(config: SearchApiConfig): SearchApiConfig {
     deepResearchSource: undefined,
     anyTxt: normalizeAnyTxtConfig(config.anyTxt),
     deepWiki: normalizeDeepWikiConfig(config.deepWiki),
+    mcpServices: normalizeMcpServiceConfigs(config.mcpServices),
   }
 }
 

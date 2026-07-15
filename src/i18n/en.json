@@ -540,6 +540,7 @@
         "deepResearchSourcesHint": "Web Search uses the selected online provider. AnyTXT searches local indexed files through ATGUI.exe on this machine.",
         "sourceWeb": "Web Search",
         "sourceAnyTxt": "AnyTXT",
+        "sourceMcpServices": "MCP Services",
         "sourceBoth": "Both",
         "webProviders": "Web Search providers",
         "anyTxtTitle": "AnyTXT local file search",

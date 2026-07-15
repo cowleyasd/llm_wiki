@@ -8,12 +8,14 @@ import {
   type AnyTxtConfig,
   type DeepResearchSourceId,
   type DeepWikiSourceConfig,
+  type McpServiceConfig,
   type SearchApiConfig,
   type SearchProvider,
   type SearchProviderOverride,
 } from "@/stores/wiki-store"
 import { normalizeAnyTxtConfig } from "@/lib/anytxt-search"
 import { normalizeDeepWikiConfig } from "@/lib/deepwiki-source"
+import { hasConfiguredMcpServices, normalizeMcpServiceConfigs } from "@/lib/mcp-source"
 import {
   SEARXNG_CATEGORY_OPTIONS,
   SERPAPI_ENGINE_OPTIONS,
@@ -163,6 +165,13 @@ export function WebSearchSection() {
     setTimeout(() => setSavedId((cur) => (cur === "deepwiki" ? null : cur)), 1500)
   }
 
+  function updateMcpServices(services: McpServiceConfig[]) {
+    const next = resolveSearchConfig({ ...resolvedConfig, mcpServices: services })
+    persist(next).catch(() => {})
+    setSavedId("mcpServices")
+    setTimeout(() => setSavedId((cur) => (cur === "mcpServices" ? null : cur)), 1500)
+  }
+
   function updateAnyTxt(patch: AnyTxtConfig) {
     const next = resolveSearchConfig({
       ...resolvedConfig,
@@ -192,18 +201,21 @@ export function WebSearchSection() {
             {t("settings.sections.webSearch.deepResearchSourcesHint")}
           </p>
         </div>
-        <div className="grid gap-2 sm:grid-cols-3">
+        <div className="grid gap-2 sm:grid-cols-4">
           {([
             "web",
             "anytxt",
             "deepwiki",
+            "mcpServices",
           ] as const).map((source) => {
             const selected = (resolvedConfig.deepResearchSources ?? ["web"]).includes(source)
             const label = source === "web"
               ? t("settings.sections.webSearch.sourceWeb")
               : source === "anytxt"
                 ? t("settings.sections.webSearch.sourceAnyTxt")
-                : t("settings.sections.webSearch.sourceDeepWiki", "DeepWiki")
+                : source === "deepwiki"
+                  ? t("settings.sections.webSearch.sourceDeepWiki", "DeepWiki")
+                  : t("settings.sections.webSearch.sourceMcpServices", "MCP Services")
             return (
               <button
                 key={source}
@@ -228,6 +240,11 @@ export function WebSearchSection() {
       <DeepWikiConfigCard
         resolvedConfig={resolvedConfig}
         onSave={updateDeepWiki}
+      />
+
+      <McpServicesConfigCard
+        resolvedConfig={resolvedConfig}
+        onSave={updateMcpServices}
       />
 
       <div className="space-y-3 rounded-lg border p-3">
@@ -692,6 +709,71 @@ function DeepWikiConfigCard({
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+function McpServicesConfigCard({
+  resolvedConfig,
+  onSave,
+}: {
+  resolvedConfig: SearchApiConfig
+  onSave: (services: McpServiceConfig[]) => void
+}) {
+  const { t } = useTranslation()
+  const services = normalizeMcpServiceConfigs(resolvedConfig.mcpServices)
+  const [text, setText] = useState(() => JSON.stringify(services, null, 2))
+  const [error, setError] = useState<string | null>(null)
+
+  function apply() {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch (e) {
+      setError(t("settings.sections.webSearch.mcpJsonError", "Invalid JSON") + ": " + (e as Error).message)
+      return
+    }
+    const arr = (Array.isArray(parsed) ? parsed : [parsed]).filter(
+      (v): v is McpServiceConfig => typeof v === "object" && v !== null,
+    )
+    onSave(arr)
+    setError(null)
+    setText(JSON.stringify(normalizeMcpServiceConfigs(arr), null, 2))
+  }
+
+  return (
+    <div className="space-y-3 rounded-lg border p-3">
+      <div>
+        <Label>{t("settings.sections.webSearch.sourceMcpServices", "MCP Services")}</Label>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {t(
+            "settings.sections.webSearch.mcpServicesHint",
+            "Paste MCP service configs as JSON (array or single object). Each service needs endpoint, toolName, and an argument template containing the topic placeholder (unquoted). Optional: name, enabled, authHeaders, timeoutSecs, maxSnippetChars. Any enabled service failing aborts the research.",
+          )}
+        </p>
+      </div>
+      <textarea
+        className="min-h-[220px] w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        spellCheck={false}
+        placeholder={t("settings.sections.webSearch.mcpJsonPlaceholder", "Paste a JSON array of MCP service configs")}
+      />
+      {error && <p className="text-xs text-destructive">{error}</p>}
+      <div className="flex items-center gap-2">
+        <button type="button" onClick={apply} className="rounded-md border px-3 py-1 text-xs hover:bg-accent">
+          {t("settings.sections.webSearch.mcpApply", "Apply")}
+        </button>
+        {hasConfiguredMcpServices(resolvedConfig.mcpServices) ? (
+          <span className="text-[10px] text-emerald-600">
+            {t("settings.sections.webSearch.mcpConfigured", "configured")}
+          </span>
+        ) : services.length > 0 ? (
+          <span className="text-[10px] text-amber-600">
+            {t("settings.sections.webSearch.mcpNotConfigured", "at least one enabled service needs endpoint + toolName")}
+          </span>
+        ) : null}
+      </div>
     </div>
   )
 }

@@ -1,6 +1,7 @@
 import { anyTxtSearchSmart, hasConfiguredAnyTxt } from "./anytxt-search"
 import { hasConfiguredSearchProvider, resolveSearchConfig, webSearch, type WebSearchResult } from "./web-search"
 import { deepWikiSearch, hasConfiguredDeepWiki } from "./deepwiki-source"
+import { mcpServicesSearch, hasConfiguredMcpServices, isMcpResult, escapeMarkdownForRef } from "./mcp-source"
 import type { GapContext, ResearchContext, ReviewItemSnapshot } from "./deepwiki-assembly"
 import { streamChat } from "./llm-client"
 import { currentWikiDate } from "./ingest"
@@ -19,6 +20,7 @@ interface ResearchSourceDeps {
   webSearch: typeof webSearch
   anyTxtSearch: typeof anyTxtSearchSmart
   deepWikiSearch: typeof deepWikiSearch
+  mcpServicesSearch: typeof mcpServicesSearch
 }
 
 interface CollectResearchSourceOptions {
@@ -130,7 +132,7 @@ export async function collectResearchSources(
   queries: string[],
   searchConfig: SearchApiConfig,
   projectPath: string,
-  deps: ResearchSourceDeps = { webSearch, anyTxtSearch: anyTxtSearchSmart, deepWikiSearch },
+  deps: ResearchSourceDeps = { webSearch, anyTxtSearch: anyTxtSearchSmart, deepWikiSearch, mcpServicesSearch },
   options: CollectResearchSourceOptions = {},
 ): Promise<ResearchSourceCollection> {
   const resolvedSearchConfig = resolveSearchConfig(searchConfig)
@@ -138,10 +140,12 @@ export async function collectResearchSources(
   const useWeb = sources.includes("web")
   const useAnyTxt = sources.includes("anytxt")
   const useDeepWiki = sources.includes("deepwiki")
+  const useMcpServices = sources.includes("mcpServices")
 
   const webConfigured = hasConfiguredSearchProvider(resolvedSearchConfig)
   const anyTxtConfigured = hasConfiguredAnyTxt(resolvedSearchConfig.anyTxt)
   const deepWikiConfigured = hasConfiguredDeepWiki(resolvedSearchConfig.deepWiki)
+  const mcpConfigured = hasConfiguredMcpServices(resolvedSearchConfig.mcpServices)
 
   const allResults: WebSearchResult[] = []
   const errors: ResearchSourceError[] = []
@@ -213,6 +217,25 @@ export async function collectResearchSources(
     }
   }
 
+  // MCP services run concurrently; results appended separately after settle,
+  // bypassing the 20-result cap (long-form answers, like DeepWiki). Each
+  // enabled service must be fully configured - an enabled-but-incomplete
+  // service is a failure with its name, not a silent skip (checked inside
+  // mcpServicesSearch).
+  let mcpServicesTracked: Promise<{ source: string; results: WebSearchResult[]; error: string | null }> | null = null
+  if (useMcpServices) {
+    if (mcpConfigured && options.context) {
+      mcpServicesTracked = trackSourceCall(
+        "mcpServices",
+        deps.mcpServicesSearch(options.context, resolvedSearchConfig.mcpServices ?? []),
+      )
+    } else if (!mcpConfigured) {
+      errors.push({ source: "mcpServices", message: "MCP source not configured" })
+    } else {
+      errors.push({ source: "mcpServices", message: "MCP missing research context" })
+    }
+  }
+
   const settled = await Promise.all(trackedCalls)
   for (const item of settled) {
     if (item.error) {
@@ -232,6 +255,23 @@ export async function collectResearchSources(
         const key = (r.url || `${r.source}:${r.title}:${r.snippet}`).toLowerCase()
         if (!seenUrls.has(key)) {
           seenUrls.add(key)
+          allResults.push(r)
+        }
+      }
+    }
+  }
+
+  if (mcpServicesTracked) {
+    const mcp = await mcpServicesTracked
+    if (mcp.error) {
+      errors.push({ source: "mcpServices", message: mcp.error })
+    } else {
+      // Bypass the 20-cap; dedupe by url (each MCP result url is unique:
+      // mcp://source/<id>/<index>, so r.url is a safe dedupe key - no reverse
+      // parsing needed).
+      for (const r of mcp.results) {
+        if (!seenUrls.has(r.url.toLowerCase())) {
+          seenUrls.add(r.url.toLowerCase())
           allResults.push(r)
         }
       }
@@ -324,7 +364,7 @@ async function executeResearch(
       queries,
       searchConfig,
       pp,
-      { webSearch, anyTxtSearch: anyTxtSearchSmart, deepWikiSearch },
+      { webSearch, anyTxtSearch: anyTxtSearchSmart, deepWikiSearch, mcpServicesSearch },
       { llmConfig, context: researchContext },
     )
     if (!isActiveProjectPath(pp)) return
@@ -414,7 +454,11 @@ async function executeResearch(
     const filePath = `${pp}/wiki/queries/${fileName}`
 
     const references = webResults
-      .map((r, i) => `${i + 1}. [${r.title}](${r.url}) — ${r.source}`)
+      .map((r, i) =>
+        isMcpResult(r)
+          ? `${i + 1}. ${escapeMarkdownForRef(r.title)} — ${escapeMarkdownForRef(r.source)}`
+          : `${i + 1}. [${r.title}](${r.url}) — ${r.source}`,
+      )
       .join("\n")
 
     // Strip <think>/<thinking> blocks before saving

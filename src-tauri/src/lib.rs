@@ -648,6 +648,7 @@ pub fn run() {
             commands::external_search::web_search,
             commands::external_search::anytxt_search,
             commands::deepwiki_search::deepwiki_search,
+            commands::mcp_search::mcp_service_search,
             clip_server_status,
             api_server_status,
             api_server_reload_config,

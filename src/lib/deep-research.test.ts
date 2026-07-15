@@ -29,6 +29,13 @@ const deepWikiResult: WebSearchResult = {
   source: "DeepWiki",
 }
 
+const mcpResult: WebSearchResult = {
+  title: "wiki-svc",
+  url: "mcp://source/svc-a/0",
+  snippet: "mcp long-form answer",
+  source: "MCP: wiki-svc",
+}
+
 function config(patch: Partial<SearchApiConfig>): SearchApiConfig {
   return {
     provider: "none",
@@ -43,8 +50,9 @@ function makeDeps(
   web: ReturnType<typeof vi.fn>,
   anytxt: ReturnType<typeof vi.fn>,
   deepwiki: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue([]),
+  mcp: ReturnType<typeof vi.fn> = vi.fn().mockResolvedValue([]),
 ) {
-  return { webSearch: web as never, anyTxtSearch: anytxt as never, deepWikiSearch: deepwiki as never }
+  return { webSearch: web as never, anyTxtSearch: anytxt as never, deepWikiSearch: deepwiki as never, mcpServicesSearch: mcp as never }
 }
 
 describe("makeDeepResearchFileName", () => {
@@ -251,6 +259,79 @@ describe("collectResearchSources", () => {
     expect(out.errors).toEqual([
       { source: "deepwiki", message: "DeepWiki source not configured" },
     ])
+  })
+
+  it("calls MCP services and appends results past the 20-cap, deduping by url", async () => {
+    const webSearch = vi.fn().mockResolvedValue([webResult])
+    const anyTxtSearch = vi.fn().mockResolvedValue([])
+    const deepWikiSearch = vi.fn().mockResolvedValue([])
+    const mcpServicesSearch = vi.fn().mockResolvedValue([mcpResult])
+
+    const out = await collectResearchSources(
+      ["alpha"],
+      config({
+        deepResearchSources: ["web", "mcpServices"],
+        provider: "tavily",
+        apiKey: "tvly",
+        mcpServices: [{ id: "svc-a", name: "wiki-svc", enabled: true, endpoint: "https://x", toolName: "t", argumentTemplate: "{}" }],
+      }),
+      "/project",
+      makeDeps(webSearch, anyTxtSearch, deepWikiSearch, mcpServicesSearch),
+      { llmConfig: { provider: "openai", apiKey: "k", model: "m", endpoint: "" } as never, context: { topic: "alpha", wikiIndex: "", purpose: "" } },
+    )
+
+    expect(mcpServicesSearch).toHaveBeenCalledTimes(1)
+    expect(out.results).toEqual([webResult, mcpResult])
+  })
+
+  it("records a structured error when MCP is selected but not configured", async () => {
+    const webSearch = vi.fn().mockResolvedValue([webResult])
+    const anyTxtSearch = vi.fn().mockResolvedValue([])
+    const deepWikiSearch = vi.fn().mockResolvedValue([])
+    const mcpServicesSearch = vi.fn().mockResolvedValue([])
+
+    const out = await collectResearchSources(
+      ["alpha"],
+      config({
+        deepResearchSources: ["web", "mcpServices"],
+        provider: "tavily",
+        apiKey: "tvly",
+        mcpServices: [],
+      }),
+      "/project",
+      makeDeps(webSearch, anyTxtSearch, deepWikiSearch, mcpServicesSearch),
+      { llmConfig: { provider: "openai", apiKey: "k", model: "m", endpoint: "" } as never, context: { topic: "alpha", wikiIndex: "", purpose: "" } },
+    )
+
+    expect(mcpServicesSearch).not.toHaveBeenCalled()
+    expect(out.errors).toContainEqual({ source: "mcpServices", message: "MCP source not configured" })
+  })
+
+  it("records a structured error (abort) when an MCP service call rejects", async () => {
+    const webSearch = vi.fn().mockResolvedValue([webResult])
+    const anyTxtSearch = vi.fn().mockResolvedValue([])
+    const deepWikiSearch = vi.fn().mockResolvedValue([])
+    const mcpServicesSearch = vi.fn().mockRejectedValue(
+      new Error('MCP service "wiki-svc" is enabled but not fully configured (missing endpoint or toolName)'),
+    )
+
+    const out = await collectResearchSources(
+      ["alpha"],
+      config({
+        deepResearchSources: ["web", "mcpServices"],
+        provider: "tavily",
+        apiKey: "tvly",
+        mcpServices: [{ id: "svc-a", name: "wiki-svc", enabled: true, endpoint: "https://x", toolName: "t", argumentTemplate: "{}" }],
+      }),
+      "/project",
+      makeDeps(webSearch, anyTxtSearch, deepWikiSearch, mcpServicesSearch),
+      { llmConfig: { provider: "openai", apiKey: "k", model: "m", endpoint: "" } as never, context: { topic: "alpha", wikiIndex: "", purpose: "" } },
+    )
+
+    expect(out.errors).toContainEqual({
+      source: "mcpServices",
+      message: 'MCP service "wiki-svc" is enabled but not fully configured (missing endpoint or toolName)',
+    })
   })
 
   it("returns no results for blank queries", async () => {

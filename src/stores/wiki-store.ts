@@ -54,7 +54,7 @@ export type SearchProvider =
   | "none"
 export type DeepResearchSource = "web" | "anytxt" | "both"
 /** Selectable deep-research information sources (list model, supersedes the legacy scalar {@link DeepResearchSource}). */
-export type DeepResearchSourceId = "web" | "anytxt" | "deepwiki"
+export type DeepResearchSourceId = "web" | "anytxt" | "deepwiki" | "mcpServices"
 export type SerpApiEngine =
   | "google"
   | "google_news"
@@ -114,6 +114,24 @@ export interface DeepWikiSourceConfig {
   maxSnippetChars?: number
 }
 
+/**
+ * Configuration for one MCP (Model Context Protocol) service used as a Deep
+ * Research information source. `id` is a stable frontend-generated key;
+ * endpoint / toolName / argumentTemplate are user-supplied (no hardcoded
+ * defaults, per CLAUDE.md).
+ */
+export interface McpServiceConfig {
+  id: string
+  name: string
+  enabled: boolean
+  endpoint: string
+  authHeaders?: Record<string, string>
+  toolName: string
+  argumentTemplate: string
+  timeoutSecs?: number
+  maxSnippetChars?: number
+}
+
 interface SearchApiConfig {
   provider: SearchProvider
   apiKey: string
@@ -127,6 +145,7 @@ interface SearchApiConfig {
   deepResearchSources?: DeepResearchSourceId[]
   anyTxt?: AnyTxtConfig
   deepWiki?: DeepWikiSourceConfig
+  mcpServices?: McpServiceConfig[]
 }
 
 interface EmbeddingConfig {

@@ -540,6 +540,7 @@
         "deepResearchSourcesHint": "网页搜索使用当前选中的在线搜索 Provider。AnyTXT 会通过本机 ATGUI.exe 的本地索引搜索文件内容。",
         "sourceWeb": "网页搜索",
         "sourceAnyTxt": "AnyTXT",
+        "sourceMcpServices": "MCP 服务",
         "sourceBoth": "两者都用",
         "webProviders": "网页搜索 Provider",
         "anyTxtTitle": "AnyTXT 本地文件搜索",
