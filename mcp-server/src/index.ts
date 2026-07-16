@@ -296,10 +296,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       case "llm_wiki_drop_source": {
         await assertMcpEnabled()
+        const scope = await resolveProjectScope(args)
         const name = stringArg(args.name, "name")
         const content = stringArg(args.content, "content")
         return textResult(
-          JSON.stringify(await client.dropSource(projectId(args), name, content), null, 2),
+          withActiveProject(JSON.stringify(await client.dropSource(scope.id, name, content), null, 2), scope.project, scope.id),
         )
       }
       default:
