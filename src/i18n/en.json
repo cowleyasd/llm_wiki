@@ -458,6 +458,19 @@
           "custom": "Custom",
           "budgetTokens": "thinking budget tokens",
           "hint": "Structured tasks such as ingest may override this to Off to avoid reasoning-only responses."
+        },
+        "chatLlm": {
+          "title": "Chat LLM (optional)",
+          "description": "Use a separate LLM for chat Q&A. Leave off to use the main LLM for everything. Ingest / Deep Research / Lint always use the main LLM.",
+          "useMain": "Use main LLM",
+          "enabled": "Separate chat LLM",
+          "provider": "Provider",
+          "model": "Model",
+          "endpoint": "Custom endpoint",
+          "apiKey": "API key",
+          "maxContext": "Max context size",
+          "save": "Save",
+          "saving": "Saving..."
         }
       },
       "embedding": {

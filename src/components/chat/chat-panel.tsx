@@ -462,7 +462,8 @@ export function ChatPanel() {
 
   const project = useWikiStore((s) => s.project)
   const projectPathIndex = useWikiStore((s) => s.projectPathIndex)
-  const llmConfig = useWikiStore((s) => s.llmConfig)
+  const llmConfig = useWikiStore((s) => s.chatLlmConfig ?? s.llmConfig)
+  const mainLlmConfig = useWikiStore((s) => s.llmConfig)
   const searchApiConfig = useWikiStore((s) => s.searchApiConfig)
   const anyTxtAvailable = hasConfiguredAnyTxt(searchApiConfig.anyTxt)
   const imageInputAvailable = supportsImageInput(llmConfig)
@@ -1358,12 +1359,12 @@ export function ChatPanel() {
     if (!project) return
     const pp = normalizePath(project.path)
     try {
-      await executeIngestWrites(pp, llmConfig, undefined, undefined)
+      await executeIngestWrites(pp, mainLlmConfig, undefined, undefined)
       await refreshProjectFileTree(pp, { bumpDataVersion: true })
     } catch (err) {
       console.error("Failed to write to wiki:", err)
     }
-  }, [project, llmConfig])
+  }, [project, mainLlmConfig])
 
   const hasAssistantMessages = activeMessages.some((m) => m.role === "assistant")
   const showWriteButton = mode === "ingest" && !activeStreaming && hasAssistantMessages

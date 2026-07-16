@@ -1,4 +1,5 @@
 import { load } from "@tauri-apps/plugin-store"
+import { invoke } from "@tauri-apps/api/core"
 import type { WikiProject } from "@/types/wiki"
 import type { ApiConfig, GeneralConfig, LlmConfig, SearchApiConfig, EmbeddingConfig, MineruConfig, MultimodalConfig, OutputLanguage, ProviderConfigs, ProxyConfig, ScheduledImportConfig, SourceWatchConfig } from "@/stores/wiki-store"
 import { normalizeSourceWatchConfig } from "@/lib/source-watch-config"
@@ -53,6 +54,36 @@ export async function saveLlmConfig(config: LlmConfig): Promise<void> {
 export async function loadLlmConfig(): Promise<LlmConfig | null> {
   const store = await getStore()
   return (await store.get<LlmConfig>(LLM_CONFIG_KEY)) ?? null
+}
+
+const CHAT_LLM_CONFIG_KEY = "chatLlmConfig"
+
+/**
+ * Persist the optional chat-only LLM config. Forces a flush (plugin-store
+ * autoSave is debounced 100ms; the Rust chat agent reads app-state.json
+ * directly, so we must ensure the file is written before returning) and
+ * invalidates the API server's 5s app-state cache so HTTP /chat picks up the
+ * new config immediately. Callers should await this before allowing the user
+ * to send a chat message.
+ */
+export async function saveChatLlmConfig(config: LlmConfig | null): Promise<void> {
+  const store = await getStore()
+  if (config === null) {
+    await store.set(CHAT_LLM_CONFIG_KEY, null)
+  } else {
+    await store.set(CHAT_LLM_CONFIG_KEY, config)
+  }
+  await store.save()
+  // api_server_reload_config encodes internal errors as strings, not rejections.
+  const result = await invoke<string>("api_server_reload_config")
+  if (result !== "ok") {
+    console.warn("[chatLlmConfig] api_server_reload_config returned:", result)
+  }
+}
+
+export async function loadChatLlmConfig(): Promise<LlmConfig | null> {
+  const store = await getStore()
+  return (await store.get<LlmConfig | null>(CHAT_LLM_CONFIG_KEY)) ?? null
 }
 
 export async function saveProviderConfigs(configs: ProviderConfigs): Promise<void> {
