@@ -63,3 +63,24 @@ Persisted config is loaded as an **unchecked generic cast** (`project-store.ts`)
 - i18n: `src/i18n/en.json` + `zh.json`. UI text uses `t(key, "fallback")` — fallbacks render even if the key isn't translated yet.
 - Tests live next to source (`*.test.ts`). `*.real-llm.test.ts` suffix marks tests needing a live server; excluded from `test:mocks`.
 - The `.claude/` dir and `plan.md` are gitignored (local planning, not shipped).
+
+## Release & Versioning
+
+This repo is a fork of `nashsu/llm_wiki` (remote `upstream`). The fork lives at `cowleyasd/llm_wiki` (remote `origin`).
+
+**Version numbers (do not get this wrong):**
+- The base version (e.g. `0.6.3`) tracks **upstream** — we do not bump minor/major ourselves. Only bump the base when upstream releases a new version.
+- Fork suffix is a **numeric-only prerelease**: `0.6.3-1`, `0.6.3-2`, `0.6.3-3`… increment the number on each fork release. **No text identifiers** (not `cowley.1`, not `cowleyasd.1`) — numeric-only is required for MSI/build compatibility (see commit `2f519db`).
+- Find the last fork tag: `git tag --sort=-creatordate | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$' | head -1`, then +1 the number.
+- Bump `version` in **both** `package.json` and `src-tauri/tauri.conf.json` (keep them in sync). Tag `v<version>` (e.g. `v0.6.3-2`).
+
+**Build/release flow:**
+- `.github/workflows/build.yml` triggers on `v*` tag push (or manual `workflow_dispatch`) and produces macOS/Windows/Linux installers (~50 min). Plain commits do not trigger it.
+- `.github/workflows/ci.yml` runs on every push (typecheck/cargo check/tests), no installers.
+- Release procedure (commit → tag → push → watch build → download macOS → install → switch from dev to released app) is codified in the `release-deploy` skill. Invoke it when the user says "发布部署" / "release" / "deploy" / "打个包发上去".
+
+**Privacy:** `app-state.json` (in `~/Library/Application Support/com.llmwiki.app/`, holds LLM apiKey / DeepWiki token / embedding config) and `plan.md` never enter the repo. Verify `git status` before every commit. The released app shares the same bundle id (`com.llmwiki.app`) as the dev build, so config is shared automatically — no manual sync needed when switching.
+
+## Plan review gate
+
+Implementation plans (`plan.md`) must pass a `codex` CLI review round before coding begins. Iterate (revise plan → re-review) until codex reports no blockers. Only then start implementing. See memory `codex-review-before-implement`.
