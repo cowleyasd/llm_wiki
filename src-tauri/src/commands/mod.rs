@@ -1,6 +1,7 @@
 pub mod claude_cli;
 mod cli_resolver;
 pub mod codex_cli;
+pub mod ebook;
 pub mod external_search;
 pub mod deepwiki_search;
 pub mod mcp_search;
@@ -10,5 +11,6 @@ pub mod file_sync;
 pub mod fs;
 pub mod path_validation;
 pub mod project;
+pub mod project_maintenance;
 pub mod search;
 pub mod vectorstore;

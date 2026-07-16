@@ -653,7 +653,8 @@ async function autoIngestImpl(
   const mineruCfg = useWikiStore.getState().mineruConfig
   let mineruSucceeded = false
   let mineruSavedImages: SavedImage[] = []
-  if (isPdf && mineruCfg.enabled && mineruCfg.token) {
+  const mineruConfigured = mineruCfg.backend === "local" || Boolean(mineruCfg.token)
+  if (isPdf && mineruCfg.enabled && mineruConfigured) {
     try {
       const cacheDir = sp.substring(0, sp.lastIndexOf("/"))
       const cachePath = `${cacheDir}/.cache/${fileName}.txt`
@@ -1297,8 +1298,8 @@ async function autoIngestImpl(
         if (!pageId || ["index", "log", "overview"].includes(pageId)) continue
         try {
           const content = await readFile(`${pp}/${wpath}`)
-          const titleMatch = content.match(/^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m)
-          const title = titleMatch ? titleMatch[1].trim() : pageId
+          const fmTitle = parseFrontmatter(content).frontmatter?.title
+          const title = typeof fmTitle === "string" && fmTitle.trim() ? fmTitle.trim() : pageId
           await embedPage(pp, pageId, title, content, embCfg)
         } catch {
           // non-critical
@@ -3058,10 +3059,8 @@ async function reembedSourceSummary(
   const sourceSummaryFullPath = `${pp}/wiki/sources/${sourceSummarySlug}.md`
   try {
     const content = await readFile(sourceSummaryFullPath)
-    const titleMatch = content.match(
-      /^---\n[\s\S]*?^title:\s*["']?(.+?)["']?\s*$/m,
-    )
-    const title = titleMatch ? titleMatch[1].trim() : sourceIdentity
+    const fmTitle = parseFrontmatter(content).frontmatter?.title
+    const title = typeof fmTitle === "string" && fmTitle.trim() ? fmTitle.trim() : sourceIdentity
     const { embedPage } = await import("@/lib/embedding")
     await embedPage(pp, sourceSummarySlug, title, content, embCfg)
     console.log(`[ingest:caption] re-embedded ${sourceSummarySlug} with captioned alt text`)

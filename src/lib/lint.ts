@@ -5,6 +5,7 @@ import type { FileNode } from "@/types/wiki"
 import { useActivityStore } from "@/stores/activity-store"
 import { getFileName, getRelativePath, normalizePath } from "@/lib/path-utils"
 import { buildLanguageDirective } from "@/lib/output-language"
+import { normalizeReviewTitle } from "@/lib/review-utils"
 
 export interface LintResult {
   type: "orphan" | "broken-link" | "no-outlinks" | "semantic"
@@ -60,6 +61,30 @@ function normalizeLinkTarget(target: string): string {
     .replace(/\.md$/i, "")
     .trim()
     .toLowerCase()
+}
+
+/**
+ * Normalize a name for missing-page existence comparison. NFKC folds full-width
+ * and compatibility forms so CJK / full-width variants compare equal.
+ */
+function normalizeForExistence(s: string): string {
+  return normalizeReviewTitle(s).normalize("NFKC").trim().toLowerCase()
+}
+
+/**
+ * Decide whether an LLM `missing-page` finding actually refers to a page that
+ * already exists. The LLM does not reliably cross-reference the file list, so it
+ * flags entities whose page is already present. Only exact normalized names are
+ * accepted here. Substring matching is unsafe because short, valid page titles
+ * can also be ordinary words inside an unrelated missing-page finding.
+ */
+function missingPageAlreadyExists(
+  llmTitle: string,
+  existingPageNames: Set<string>,
+): boolean {
+  const norm = normalizeForExistence(llmTitle)
+  if (!norm) return false
+  return existingPageNames.has(norm)
 }
 
 function extractTitle(content: string, fallbackPath: string): string {
@@ -329,13 +354,20 @@ export async function runSemanticLint(
     (f) => f.name !== "log.md"
   )
 
-  // Build a compact summary of each page (frontmatter + first 500 chars)
+  // Build a compact summary of each page (frontmatter + first 500 chars), and
+  // collect the set of existing page names (basename + frontmatter title) used
+  // to filter out `missing-page` findings for pages that already exist (#537).
   const summaries: string[] = []
+  const existingPageNames = new Set<string>()
   for (const f of wikiFiles) {
+    const basename = f.name.replace(/\.md$/i, "")
+    if (basename) existingPageNames.add(normalizeForExistence(basename))
     try {
       const content = await readFile(f.path)
       const preview = content.slice(0, 500) + (content.length > 500 ? "..." : "")
       const shortPath = getRelativePath(f.path, wikiRoot)
+      const title = extractTitle(content, shortPath)
+      if (title) existingPageNames.add(normalizeForExistence(title))
       summaries.push(`### ${shortPath}\n${preview}`)
     } catch {
       // skip
@@ -370,6 +402,7 @@ export async function runSemanticLint(
     "- stale: information that appears outdated or superseded",
     "- missing-page: an important concept is heavily referenced but has no dedicated page",
     "- suggestion: a question or source worth adding to the wiki",
+    "For missing-page findings, Short title must be only the exact missing concept or entity name, without explanatory prefixes or suffixes.",
     "",
     "Severities:",
     "- warning: should be addressed",
@@ -412,8 +445,12 @@ export async function runSemanticLint(
     const title = match[3].trim()
     const body = match[4].trim()
 
-    // semantic results always use type "semantic"
-    void rawType
+    // Drop `missing-page` findings whose page already exists — the LLM often
+    // flags entities that already have a page, especially in non-English wikis
+    // where its free-form titles don't match a fixed prefix (#537).
+    if (rawType === "missing-page" && missingPageAlreadyExists(title, existingPageNames)) {
+      continue
+    }
 
     const pagesMatch = body.match(/^PAGES:\s*(.+)$/m)
     const affectedPages = pagesMatch
