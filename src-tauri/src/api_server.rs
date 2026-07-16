@@ -1836,16 +1836,9 @@ fn load_agent_runtime_config(app: &AppHandle) -> AgentRuntimeConfig {
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
         llm: parsed
-            .get("chatLlmConfig")
+            .get("llmConfig")
             .cloned()
-            .filter(|v| !v.is_null())
-            .and_then(|value| serde_json::from_value(value).ok())
-            .or_else(|| {
-                parsed
-                    .get("llmConfig")
-                    .cloned()
-                    .and_then(|value| serde_json::from_value(value).ok())
-            }),
+            .and_then(|value| serde_json::from_value(value).ok()),
         web_search: parsed
             .get("searchApiConfig")
             .cloned()

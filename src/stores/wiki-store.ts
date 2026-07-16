@@ -414,8 +414,6 @@ interface WikiState {
   pendingScrollImageSrc: string | null
   activeView: "chat" | "wiki" | "sources" | "search" | "graph" | "lint" | "review" | "skills" | "settings"
   llmConfig: LlmConfig
-  /** Optional separate LLM for chat (null = fall back to llmConfig). ingest/research/lint still use llmConfig. */
-  chatLlmConfig: LlmConfig | null
   /** Per-provider-preset stored overrides (API key, model, endpoint, …). */
   providerConfigs: ProviderConfigs
   /** Which preset is currently active. `null` = no LLM configured. */
@@ -445,7 +443,6 @@ interface WikiState {
   setPendingScrollImageSrc: (src: string | null) => void
   setActiveView: (view: WikiState["activeView"]) => void
   setLlmConfig: (config: LlmConfig) => void
-  setChatLlmConfig: (config: LlmConfig | null) => void
   setProviderConfigs: (configs: ProviderConfigs) => void
   setActivePresetId: (id: string | null) => void
   setSearchApiConfig: (config: SearchApiConfig) => void
@@ -485,7 +482,6 @@ export const useWikiStore = create<WikiState>((set) => ({
     reasoning: { mode: "auto" },
     localCliIsolation: false,
   },
-  chatLlmConfig: null,
   providerConfigs: {},
   activePresetId: null,
 
@@ -629,7 +625,6 @@ export const useWikiStore = create<WikiState>((set) => ({
   graphUiState: createDefaultGraphUiState(),
 
   setLlmConfig: (llmConfig) => set({ llmConfig }),
-  setChatLlmConfig: (chatLlmConfig) => set({ chatLlmConfig }),
   setProviderConfigs: (providerConfigs) => set({ providerConfigs }),
   setActivePresetId: (activePresetId) => set({ activePresetId }),
   setSearchApiConfig: (searchApiConfig) => set({ searchApiConfig }),

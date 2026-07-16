@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next"
 import { invoke } from "@tauri-apps/api/core"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { useWikiStore, type ProviderOverride, type ReasoningConfig, type ReasoningMode, type LlmConfig } from "@/stores/wiki-store"
+import { useWikiStore, type ProviderOverride, type ReasoningConfig, type ReasoningMode } from "@/stores/wiki-store"
 import { LLM_PRESETS, type LlmPreset } from "../llm-presets"
 import { ContextSizeSelector } from "../context-size-selector"
 import { disabledLlmConfig, resolveConfig } from "../preset-resolver"
@@ -20,8 +20,6 @@ export function LlmProviderSection() {
   const setActivePresetId = useWikiStore((s) => s.setActivePresetId)
   const setLlmConfig = useWikiStore((s) => s.setLlmConfig)
   const llmConfig = useWikiStore((s) => s.llmConfig)
-  const chatLlmConfig = useWikiStore((s) => s.chatLlmConfig)
-  const setChatLlmConfig = useWikiStore((s) => s.setChatLlmConfig)
 
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [savedId, setSavedId] = useState<string | null>(null)
@@ -100,12 +98,6 @@ export function LlmProviderSection() {
           />
         ))}
       </div>
-
-      <ChatLlmConfigCard
-        chatLlmConfig={chatLlmConfig}
-        mainLlmConfig={llmConfig}
-        onSave={setChatLlmConfig}
-      />
     </div>
   )
 }
@@ -892,167 +884,6 @@ function CodexCliStatusPill() {
           )}
         </div>
       </div>
-    </div>
-  )
-}
-
-function ChatLlmConfigCard({
-  chatLlmConfig,
-  mainLlmConfig,
-  onSave,
-}: {
-  chatLlmConfig: LlmConfig | null
-  mainLlmConfig: LlmConfig
-  onSave: (config: LlmConfig | null) => void
-}) {
-  const { t } = useTranslation()
-  const enabled = chatLlmConfig !== null
-  const draft: LlmConfig = chatLlmConfig ?? mainLlmConfig
-  const [saving, setSaving] = useState(false)
-  const [savedFlash, setSavedFlash] = useState(false)
-  // Track which preset the user picked (multiple presets can share provider="custom",
-  // so we can't derive it from draft.provider). Persisted across re-renders.
-  const [selectedPresetId, setSelectedPresetId] = useState<string>(() => {
-    // Try to match the current chat config to a preset by baseUrl+model.
-    const match = LLM_PRESETS.find(
-      (p) => p.baseUrl && p.baseUrl === draft.customEndpoint && p.defaultModel === draft.model,
-    )
-    return match?.id ?? ""
-  })
-
-  function patch(p: Partial<LlmConfig>) {
-    if (!enabled) return
-    onSave({ ...draft, ...p })
-  }
-
-  async function save() {
-    setSaving(true)
-    try {
-      const { saveChatLlmConfig } = await import("@/lib/project-store")
-      await saveChatLlmConfig(draft)
-      setSavedFlash(true)
-      setTimeout(() => setSavedFlash(false), 1500)
-    } catch (err) {
-      console.error("[chatLlm] save failed:", err)
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  function toggleEnabled() {
-    if (enabled) {
-      // Disable → clear chat config, fall back to main.
-      onSave(null)
-      import("@/lib/project-store").then(({ saveChatLlmConfig }) => saveChatLlmConfig(null)).catch(() => {})
-    } else {
-      // Enable → start from a copy of main config.
-      onSave({ ...mainLlmConfig })
-      import("@/lib/project-store").then(({ saveChatLlmConfig }) => saveChatLlmConfig({ ...mainLlmConfig })).catch(() => {})
-    }
-  }
-
-  function selectPreset(presetId: string) {
-    const preset = LLM_PRESETS.find((p) => p.id === presetId)
-    if (!preset) return
-    setSelectedPresetId(presetId)
-    onSave({
-      ...draft,
-      provider: preset.provider,
-      model: preset.defaultModel ?? draft.model,
-      customEndpoint: preset.baseUrl ?? draft.customEndpoint,
-    })
-  }
-
-  return (
-    <div className="space-y-3 rounded-lg border p-3">
-      <div className="flex items-center justify-between">
-        <div>
-          <Label>{t("settings.sections.llm.chatLlm.title", "Chat LLM (optional)")}</Label>
-          <p className="mt-1 text-xs text-muted-foreground">
-            {t(
-              "settings.sections.llm.chatLlm.description",
-              "Use a separate LLM for chat Q&A. Leave off to use the main LLM for everything. Ingest / Deep Research / Lint always use the main LLM.",
-            )}
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={toggleEnabled}
-          className={`rounded-md border px-3 py-1 text-xs transition-colors ${
-            enabled ? "border-primary bg-primary text-primary-foreground" : "hover:bg-accent"
-          }`}
-        >
-          {enabled
-            ? t("settings.sections.llm.chatLlm.enabled", "Separate chat LLM")
-            : t("settings.sections.llm.chatLlm.useMain", "Use main LLM")}
-        </button>
-      </div>
-      {enabled && (
-        <div className="space-y-3">
-          <div className="space-y-1">
-            <Label className="text-xs">{t("settings.sections.llm.chatLlm.provider", "Provider")}</Label>
-            <select
-              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
-              value={selectedPresetId}
-              onChange={(e) => selectPreset(e.target.value)}
-            >
-              <option value="">—</option>
-              {LLM_PRESETS.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="grid gap-2 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label className="text-xs">{t("settings.sections.llm.chatLlm.model", "Model")}</Label>
-              <Input value={draft.model} onChange={(e) => patch({ model: e.target.value })} />
-            </div>
-            <div className="space-y-1">
-              <Label className="text-xs">{t("settings.sections.llm.chatLlm.endpoint", "Custom endpoint")}</Label>
-              <Input
-                value={draft.customEndpoint}
-                onChange={(e) => patch({ customEndpoint: e.target.value })}
-                placeholder="https://..."
-              />
-            </div>
-          </div>
-          <div className="grid gap-2 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label className="text-xs">{t("settings.sections.llm.chatLlm.apiKey", "API key")}</Label>
-              <Input
-                type="password"
-                value={draft.apiKey}
-                onChange={(e) => patch({ apiKey: e.target.value })}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label className="text-xs">{t("settings.sections.llm.chatLlm.maxContext", "Max context size")}</Label>
-              <Input
-                type="number"
-                value={draft.maxContextSize}
-                onChange={(e) => patch({ maxContextSize: Number(e.target.value) || 204800 })}
-              />
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={save}
-              disabled={saving}
-              className="rounded-md border px-3 py-1 text-xs hover:bg-accent disabled:opacity-50"
-            >
-              {saving ? t("settings.sections.llm.chatLlm.saving", "Saving...") : t("settings.sections.llm.chatLlm.save", "Save")}
-            </button>
-            {savedFlash && (
-              <span className="text-[10px] text-emerald-600">
-                {t("settings.sections.webSearch.savedBadge", "Saved")}
-              </span>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   )
 }
