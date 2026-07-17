@@ -128,6 +128,31 @@ describe("runDeepWikiQueryRecord", () => {
   })
 })
 
+describe("resumeDeepWikiQueries", () => {
+  it("re-runs prompt_ready and searching records, skips ingested/failed", async () => {
+    // Cannot vi.spyOn runDeepWikiQueryRecord (same-module local binding — ES
+    // module live-binding interception doesn't reach internal calls). Instead
+    // assert on the observable side effect: resume calls the DeepWiki search
+    // (invoke) exactly for the prompt_ready + searching records, and NOT for
+    // ingested/failed.
+    const { invoke } = await import("@tauri-apps/api/core")
+    ;(invoke as any).mockReset()
+    ;(invoke as any).mockResolvedValue({ content: "answer", spaceUrl: "" })
+    const ready = { ...createDeepWikiRecord({ topic: "a", prompt: "p-a" }), status: "prompt_ready" as const }
+    const searching = { ...createDeepWikiRecord({ topic: "b", prompt: "p-b" }), status: "searching" as const }
+    const ingested = { ...createDeepWikiRecord({ topic: "c", prompt: "p-c" }), status: "ingested" as const }
+    const failed = { ...createDeepWikiRecord({ topic: "d", prompt: "p-d" }), status: "failed" as const, error: "x" }
+    await saveDeepWikiRecords(tmpDir!, [ready, searching, ingested, failed])
+    await (await import("./deepwiki-channel")).resumeDeepWikiQueries(tmpDir!, {} as any, {} as any, "proj-1")
+    // settle the fire-and-forget workers
+    await new Promise((r) => setTimeout(r, 50))
+    const invokedPrompts = (invoke as any).mock.calls.map((c: any[]) => c[1]?.prompt)
+    expect(invokedPrompts).toEqual(expect.arrayContaining(["p-a", "p-b"]))
+    expect(invokedPrompts).not.toContain("p-c")
+    expect(invokedPrompts).not.toContain("p-d")
+  })
+})
+
 describe("triggerDeepWikiQuery assembly timeout", () => {
   it("abort on timeout, writes no record", async () => {
     vi.useFakeTimers()

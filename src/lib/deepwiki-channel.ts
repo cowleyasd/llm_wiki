@@ -118,6 +118,28 @@ export async function retryDeepWikiQuery(
   await runDeepWikiQueryRecord(projectPath, record, llmConfig, deepWikiConfig, projectId)
 }
 
+/**
+ * Restart recovery: load persisted records, hydrate the store, and re-run the
+ * async worker for any record left mid-flight (prompt_ready / searching) when
+ * the app closed. ingested / failed records are left as-is. Workers are
+ * fire-and-forget (same as trigger) — their errors land in record.status=failed.
+ */
+export async function resumeDeepWikiQueries(
+  projectPath: string,
+  llmConfig: LlmConfig,
+  deepWikiConfig: DeepWikiSourceConfig,
+  projectId: string,
+): Promise<void> {
+  const records = await loadDeepWikiRecords(projectPath)
+  useDeepWikiStore.getState().setRecords(records)
+  const toResume = records.filter((r) => r.status === "prompt_ready" || r.status === "searching")
+  for (const r of toResume) {
+    void runDeepWikiQueryRecord(projectPath, r, llmConfig, deepWikiConfig, projectId).catch((err) =>
+      console.warn(`[deepwiki-channel] resume failed for ${r.id}:`, err),
+    )
+  }
+}
+
 export type DeepWikiQueryStatus = "prompt_ready" | "searching" | "ingested" | "failed"
 
 export interface DeepWikiQueryRecord {
