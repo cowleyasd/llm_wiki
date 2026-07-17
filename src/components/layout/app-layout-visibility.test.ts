@@ -30,9 +30,18 @@ describe("getAppLayoutVisibility", () => {
       showLeftPanel: true,
       hasRightPanel: false,
     })
-    expect(getAppLayoutVisibility("search", true, false)).toEqual({
+    // Research panel only renders on the wiki view.
+    expect(getAppLayoutVisibility("wiki", true, false)).toEqual({
       showLeftPanel: true,
       hasRightPanel: true,
+    })
+    expect(getAppLayoutVisibility("search", true, false)).toEqual({
+      showLeftPanel: true,
+      hasRightPanel: false,
+    })
+    expect(getAppLayoutVisibility("graph", true, false)).toEqual({
+      showLeftPanel: true,
+      hasRightPanel: false,
     })
   })
 
@@ -40,6 +49,11 @@ describe("getAppLayoutVisibility", () => {
     expect(getAppLayoutVisibility("wiki", false, true)).toEqual({
       showLeftPanel: true,
       hasRightPanel: true,
+    })
+    // DeepWiki panel only renders on the wiki view, like Research.
+    expect(getAppLayoutVisibility("graph", false, true)).toEqual({
+      showLeftPanel: true,
+      hasRightPanel: false,
     })
     // Standalone views still hide the right panel even with DeepWiki open.
     expect(getAppLayoutVisibility("chat", false, true)).toEqual({

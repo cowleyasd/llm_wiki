@@ -12,6 +12,7 @@ import { useResearchStore } from "@/stores/research-store"
 import { useDeepWikiStore } from "@/stores/deepwiki-store"
 import { ErrorBoundary } from "@/components/error-boundary"
 import { getAppLayoutVisibility } from "./app-layout-visibility"
+import { isResearchPanelVisible, isDeepWikiPanelVisible } from "./research-panel-nav"
 import { PanelLeftOpen } from "lucide-react"
 import { useTranslation } from "react-i18next"
 
@@ -168,7 +169,11 @@ export function AppLayout({ onSwitchProject }: AppLayoutProps) {
                 style={{ width: rightWidth }}
               >
                 <ErrorBoundary>
-                  {researchPanelOpen ? <ResearchPanel /> : <DeepWikiPanel />}
+                  {isResearchPanelVisible(activeView, researchPanelOpen) ? (
+                    <ResearchPanel />
+                  ) : isDeepWikiPanelVisible(activeView, deepWikiPanelOpen) ? (
+                    <DeepWikiPanel />
+                  ) : null}
                 </ErrorBoundary>
               </div>
             </>

@@ -13,7 +13,7 @@ import logoImg from "@/assets/logo.jpg"
 import type { WikiState } from "@/stores/wiki-store"
 import {
   isResearchPanelVisible,
-  isStandaloneView,
+  isDeepWikiPanelVisible,
   nextResearchPanelNavState,
 } from "./research-panel-nav"
 
@@ -79,10 +79,12 @@ export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
   }
 
   function handleDeepWikiPanelToggle() {
-    // Same nav pattern as Research: leave a non-standalone view in
-    // place, just flip the panel. Opening DeepWiki closes Research.
-    if (isStandaloneView(activeView)) setActiveView("wiki")
+    // DeepWiki panel only renders on the wiki view (it must not occupy the
+    // right column on graph/review/lint/sources/search, which need that
+    // column for PreviewPanel). So opening it from any other view switches
+    // to wiki first. Opening DeepWiki closes Research.
     const next = !deepWikiPanelOpen
+    if (next && activeView !== "wiki") setActiveView("wiki")
     toggleDeepWikiPanel(next)
     if (next) toggleResearchPanel(false)
   }
@@ -147,7 +149,7 @@ export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
             <TooltipTrigger
               onClick={handleDeepWikiPanelToggle}
               className={`relative flex h-10 w-10 items-center justify-center rounded-md transition-colors ${
-                deepWikiPanelOpen && !isStandaloneView(activeView)
+                isDeepWikiPanelVisible(activeView, deepWikiPanelOpen)
                   ? "bg-accent text-accent-foreground"
                   : "text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
               }`}
