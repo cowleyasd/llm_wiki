@@ -71,10 +71,22 @@ export async function triggerDeepWikiQuery(
   deepWikiConfig: DeepWikiSourceConfig,
   projectId: string,
 ): Promise<string> {
-  // 4th `signal` arg is added in Task 4; cast to any until the signature widens.
-  const { prompt } = await (assembleDeepWikiPrompt as any)(
-    llmConfig, context, deepWikiConfig.assemblyInstruction ?? "", /* signal — added in Task 4 */ undefined,
-  )
+  // Assembly timeout: AbortSignal threaded through assembleDeepWikiPrompt →
+  // streamChat so a stuck LLM request is truly cancelled (not raced). On
+  // timeout AbortError propagates out of assembleDeepWikiPrompt (hard failure,
+  // no template fallback) and no record is written. See Task 4.
+  const timeoutMs = (deepWikiConfig.timeoutSecs ?? 120) * 1000
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let prompt: string
+  try {
+    const result = await assembleDeepWikiPrompt(
+      llmConfig, context, deepWikiConfig.assemblyInstruction ?? "", controller.signal,
+    )
+    prompt = result.prompt
+  } finally {
+    clearTimeout(timer)
+  }
   const record = createDeepWikiRecord({
     topic: context.topic,
     prompt,

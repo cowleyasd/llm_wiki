@@ -4,7 +4,7 @@ import * as path from "path"
 import * as os from "os"
 import {
   createDeepWikiRecord, loadDeepWikiRecords, saveDeepWikiRecords,
-  appendRecord, runDeepWikiQueryRecord,
+  appendRecord, runDeepWikiQueryRecord, triggerDeepWikiQuery,
 } from "./deepwiki-channel"
 
 // Tests run in Node (vitest); the MODULE under test must NOT use Node fs — it
@@ -125,5 +125,28 @@ describe("runDeepWikiQueryRecord", () => {
     const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
     expect(persisted.status).toBe("failed")
     expect(persisted.error).toMatch(/timeout/)
+  })
+})
+
+describe("triggerDeepWikiQuery assembly timeout", () => {
+  it("abort on timeout, writes no record", async () => {
+    vi.useFakeTimers()
+    const { assembleDeepWikiPrompt } = await import("@/lib/deepwiki-assembly")
+    ;(assembleDeepWikiPrompt as any).mockImplementation(
+      (_l: unknown, _c: unknown, _i: unknown, signal: AbortSignal) =>
+        new Promise((_res, rej) => {
+          signal?.addEventListener("abort", () =>
+            rej(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          )
+        }),
+    )
+    const dwConfig: any = { timeoutSecs: 1, assemblyInstruction: "" }
+    const p = triggerDeepWikiQuery(
+      tmpDir!, { topic: "T", purpose: "", wikiIndex: "" } as any, {} as any, dwConfig, "proj-1",
+    )
+    vi.advanceTimersByTime(1500)
+    await expect(p).rejects.toThrow(/abort/i)
+    expect(await loadDeepWikiRecords(tmpDir!)).toEqual([])
+    vi.useRealTimers()
   })
 })
