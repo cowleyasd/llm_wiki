@@ -80,7 +80,10 @@ async fn run_deepwiki_search(
         .build()
         .map_err(|e| format!("Failed to build DeepWiki client: {e}"))?;
 
-    let max_chars = config.max_snippet_chars;
+    // Note: max_snippet_chars is intentionally NOT used to truncate content
+    // here. DeepWiki content is written verbatim as a source file for ingest,
+    // so the full text must reach the frontend. The field remains in the
+    // config only for the hasConfiguredDeepWiki (>0) validity check.
     let timeout = Duration::from_secs(config.timeout_secs);
 
     // Wrap the entire send + SSE stream in a timeout so a hung connection or
@@ -138,7 +141,11 @@ async fn run_deepwiki_search(
                 let data = data.trim();
                 if data == "[DONE]" {
                     return Ok(DeepWikiSearchResult {
-                        content: truncate_string(&content, max_chars),
+                        // Do not truncate: DeepWiki content is written verbatim
+                        // as a source file for ingest (entities extracted from
+                        // the full text). maxSnippetChars is kept in the config
+                        // only for the hasConfiguredDeepWiki > 0 check.
+                        content: content.clone(),
                         space_url: space_url.clone(),
                     });
                 }
@@ -152,9 +159,10 @@ async fn run_deepwiki_search(
 
         // Stream ended (connection closed) without an explicit [DONE].
         // Return whatever was accumulated; empty content is treated as a
-        // failure by the frontend.
+        // failure by the frontend. Content is NOT truncated — see the
+        // [DONE] branch above for rationale.
         Ok(DeepWikiSearchResult {
-            content: truncate_string(&content, max_chars),
+            content,
             space_url,
         })
     };
