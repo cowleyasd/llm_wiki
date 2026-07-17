@@ -132,7 +132,7 @@ export function templateAssembly(context: ResearchContext): string {
  * Assembly failure is NON-fatal: if the LLM throws, reports an error,
  * returns empty, or produces unparseable output, we fall back to
  * {@link templateAssembly}. A real DeepWiki HTTP/timeout failure is fatal
- * and handled by the caller ({@link deepWikiSearch}).
+ * and handled by the caller.
  */
 export async function assembleDeepWikiPrompt(
   llmConfig: LlmConfig,

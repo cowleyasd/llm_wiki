@@ -350,7 +350,7 @@ async function executeResearch(
       if (project && isActiveProjectPath(pp)) {
         try {
           const { triggerDeepWikiQuery } = await import("@/lib/deepwiki-channel")
-          await triggerDeepWikiQuery(pp, researchContext, llmConfig, resolvedSearchConfig.deepWiki, project.id)
+          await triggerDeepWikiQuery(pp, researchContext, llmConfig, resolvedSearchConfig.deepWiki, project.id, task?.reviewItemId)
           deepWikiTriggered = true
         } catch (err) {
           console.warn("[DeepResearch] DeepWiki channel trigger failed:", err)

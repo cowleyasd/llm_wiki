@@ -70,6 +70,7 @@ export async function triggerDeepWikiQuery(
   llmConfig: LlmConfig,
   deepWikiConfig: DeepWikiSourceConfig,
   projectId: string,
+  reviewItemId?: string,
 ): Promise<string> {
   // Assembly timeout: AbortSignal threaded through assembleDeepWikiPrompt →
   // streamChat so a stuck LLM request is truly cancelled (not raced). On
@@ -90,7 +91,7 @@ export async function triggerDeepWikiQuery(
   const record = createDeepWikiRecord({
     topic: context.topic,
     prompt,
-    reviewItemId: (context.reviewItem as any)?.reviewItemId,
+    reviewItemId,
     gapContext: context.gapContext,
   })
   // Append record (prompt_ready) atomically — DR completes on durable record.
