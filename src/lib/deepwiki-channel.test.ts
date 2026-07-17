@@ -4,6 +4,7 @@ import * as path from "path"
 import * as os from "os"
 import {
   createDeepWikiRecord, loadDeepWikiRecords, saveDeepWikiRecords,
+  appendRecord, runDeepWikiQueryRecord,
 } from "./deepwiki-channel"
 
 // Tests run in Node (vitest); the MODULE under test must NOT use Node fs — it
@@ -74,5 +75,55 @@ describe("deepwiki-channel records", () => {
     await saveDeepWikiRecords(tmpDir, [r])
     const stat = await fs.stat(path.join(tmpDir, ".llm-wiki", "deepwiki-queries.json"))
     expect(stat.isFile()).toBe(true)
+  })
+})
+
+describe("runDeepWikiQueryRecord", () => {
+  it("searching -> ingested on success, writes deepwiki-<id>.md, enqueues", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    const { enqueueIngest } = await import("@/lib/ingest-queue")
+    const { writeFileAtomic } = await import("@/commands/fs")
+    ;(invoke as any).mockResolvedValue({ content: "DeepWiki answer body", spaceUrl: "http://dw" })
+
+    const record = createDeepWikiRecord({ topic: "T", prompt: "assembled-prompt" })
+    const llmConfig: any = { provider: "openai", apiKey: "k", model: "m" }
+    const dwConfig: any = { enabled: true, baseUrl: "u", spaceId: "s", model: "m", token: "t", branch: "main", timeoutSecs: 60, maxSnippetChars: 10000 }
+
+    await appendRecord(tmpDir!, record) // seed so patch can find it
+    await runDeepWikiQueryRecord(tmpDir!, record, llmConfig, dwConfig, "proj-1")
+
+    const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(persisted.status).toBe("ingested")
+    const writtenPath = (writeFileAtomic as any).mock.calls.find((c: any[]) => c[0].includes(`deepwiki-${record.id}.md`))?.[0] as string
+    expect(writtenPath).toContain(`deepwiki-${record.id}.md`)
+    expect((writeFileAtomic as any).mock.calls.find((c: any[]) => c[0] === writtenPath)?.[1]).toBe("DeepWiki answer body")
+    expect(enqueueIngest).toHaveBeenCalledWith("proj-1", writtenPath, "")
+  })
+
+  it("empty content -> failed, no source written, no enqueue", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    const { writeFileAtomic } = await import("@/commands/fs")
+    const { enqueueIngest } = await import("@/lib/ingest-queue")
+    ;(invoke as any).mockResolvedValue({ content: "   ", spaceUrl: "" })
+
+    const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
+    await appendRecord(tmpDir!, record)
+    await runDeepWikiQueryRecord(tmpDir!, record, {} as any, {} as any, "proj-1")
+    const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(persisted.status).toBe("failed")
+    expect(persisted.error).toMatch(/empty/i)
+    expect(writeFileAtomic).not.toHaveBeenCalledWith(expect.stringContaining(`deepwiki-${record.id}.md`), expect.anything())
+    expect(enqueueIngest).not.toHaveBeenCalled()
+  })
+
+  it("search throws -> failed with error message", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    ;(invoke as any).mockRejectedValue(new Error("timeout"))
+    const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
+    await appendRecord(tmpDir!, record)
+    await runDeepWikiQueryRecord(tmpDir!, record, {} as any, {} as any, "proj-1")
+    const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(persisted.status).toBe("failed")
+    expect(persisted.error).toMatch(/timeout/)
   })
 })

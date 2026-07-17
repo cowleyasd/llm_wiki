@@ -1,5 +1,110 @@
 import { writeFileAtomic, readFile, createDirectory } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
+import { invoke } from "@tauri-apps/api/core"
+import { assembleDeepWikiPrompt, type ResearchContext } from "@/lib/deepwiki-assembly"
+import { enqueueIngest } from "@/lib/ingest-queue"
+import { useDeepWikiStore } from "@/stores/deepwiki-store"
+import type { LlmConfig, DeepWikiSourceConfig } from "@/stores/wiki-store"
+
+interface DeepWikiSearchResult { content: string; spaceUrl: string }
+
+function sourceFilePath(projectPath: string, recordId: string): string {
+  return `${normalizePath(projectPath)}/raw/sources/deepwiki-${recordId}.md`
+}
+
+/** Persist record patch (whole RMW inside per-project lock) + update store. */
+async function patchRecord(
+  projectPath: string,
+  id: string,
+  patch: Partial<DeepWikiQueryRecord>,
+): Promise<DeepWikiQueryRecord | null> {
+  const updated = await mutateRecord(projectPath, id, patch)
+  if (updated) useDeepWikiStore.getState().updateRecord(id, updated)
+  return updated
+}
+
+/**
+ * Async worker: search DeepWiki with the record's stored prompt, write source
+ * file, enqueue for ingest. Updates record status through searching -> ingested/failed.
+ * Does NOT track autoIngest internal progress (ingest-queue owns that).
+ */
+export async function runDeepWikiQueryRecord(
+  projectPath: string,
+  record: DeepWikiQueryRecord,
+  _llmConfig: LlmConfig,
+  deepWikiConfig: DeepWikiSourceConfig,
+  projectId: string,
+): Promise<void> {
+  await patchRecord(projectPath, record.id, { status: "searching", error: null })
+
+  try {
+    const result = await invoke<DeepWikiSearchResult>("deepwiki_search", {
+      prompt: record.prompt,
+      config: deepWikiConfig,
+    })
+    if (!result.content?.trim()) {
+      throw new Error("DeepWiki returned an empty response")
+    }
+    const srcPath = sourceFilePath(projectPath, record.id)
+    await writeFileAtomic(srcPath, result.content)
+    await enqueueIngest(projectId, srcPath, "")
+    await patchRecord(projectPath, record.id, { status: "ingested" })
+  } catch (err) {
+    await patchRecord(projectPath, record.id, {
+      status: "failed",
+      error: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
+/**
+ * Trigger from DR: assemble prompt (with AbortSignal timeout — see Task 4),
+ * write a prompt_ready record, kick off the async worker (fire-and-forget).
+ * Returns the record id immediately so DR can complete. On hard assembly
+ * failure (timeout AND template fallback unavailable) no record is written
+ * and this throws — caller (DR) treats as DeepWiki not triggered.
+ */
+export async function triggerDeepWikiQuery(
+  projectPath: string,
+  context: ResearchContext,
+  llmConfig: LlmConfig,
+  deepWikiConfig: DeepWikiSourceConfig,
+  projectId: string,
+): Promise<string> {
+  // 4th `signal` arg is added in Task 4; cast to any until the signature widens.
+  const { prompt } = await (assembleDeepWikiPrompt as any)(
+    llmConfig, context, deepWikiConfig.assemblyInstruction ?? "", /* signal — added in Task 4 */ undefined,
+  )
+  const record = createDeepWikiRecord({
+    topic: context.topic,
+    prompt,
+    reviewItemId: (context.reviewItem as any)?.reviewItemId,
+    gapContext: context.gapContext,
+  })
+  // Append record (prompt_ready) atomically — DR completes on durable record.
+  await appendRecord(projectPath, record)
+  useDeepWikiStore.getState().addRecord(record)
+
+  // Fire-and-forget the async search+ingest. Errors land in record.status=failed.
+  void runDeepWikiQueryRecord(projectPath, record, llmConfig, deepWikiConfig, projectId)
+    .catch((err) => console.warn("[deepwiki-channel] worker crashed:", err))
+
+  return record.id
+}
+
+/** Retry: reuse stored prompt, re-run worker (status reset to searching inside). */
+export async function retryDeepWikiQuery(
+  projectPath: string,
+  recordId: string,
+  llmConfig: LlmConfig,
+  deepWikiConfig: DeepWikiSourceConfig,
+  projectId: string,
+): Promise<void> {
+  const records = await loadDeepWikiRecords(projectPath)
+  const record = records.find((r) => r.id === recordId)
+  if (!record) throw new Error(`DeepWiki record not found: ${recordId}`)
+  await runDeepWikiQueryRecord(projectPath, record, llmConfig, deepWikiConfig, projectId)
+}
 
 export type DeepWikiQueryStatus = "prompt_ready" | "searching" | "ingested" | "failed"
 
