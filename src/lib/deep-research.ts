@@ -1,6 +1,6 @@
 import { anyTxtSearchSmart, hasConfiguredAnyTxt } from "./anytxt-search"
 import { hasConfiguredSearchProvider, resolveSearchConfig, webSearch, type WebSearchResult } from "./web-search"
-import { deepWikiSearch, hasConfiguredDeepWiki } from "./deepwiki-source"
+import { hasConfiguredDeepWiki } from "./deepwiki-source"
 import { mcpServicesSearch, hasConfiguredMcpServices, isMcpResult, escapeMarkdownForRef } from "./mcp-source"
 import type { GapContext, ResearchContext, ReviewItemSnapshot } from "./deepwiki-assembly"
 import { streamChat } from "./llm-client"
@@ -19,7 +19,6 @@ const MAX_RESEARCH_SOURCES = 20
 interface ResearchSourceDeps {
   webSearch: typeof webSearch
   anyTxtSearch: typeof anyTxtSearchSmart
-  deepWikiSearch: typeof deepWikiSearch
   mcpServicesSearch: typeof mcpServicesSearch
 }
 
@@ -132,19 +131,17 @@ export async function collectResearchSources(
   queries: string[],
   searchConfig: SearchApiConfig,
   projectPath: string,
-  deps: ResearchSourceDeps = { webSearch, anyTxtSearch: anyTxtSearchSmart, deepWikiSearch, mcpServicesSearch },
+  deps: ResearchSourceDeps = { webSearch, anyTxtSearch: anyTxtSearchSmart, mcpServicesSearch },
   options: CollectResearchSourceOptions = {},
 ): Promise<ResearchSourceCollection> {
   const resolvedSearchConfig = resolveSearchConfig(searchConfig)
   const sources = resolvedSearchConfig.deepResearchSources ?? ["web"]
   const useWeb = sources.includes("web")
   const useAnyTxt = sources.includes("anytxt")
-  const useDeepWiki = sources.includes("deepwiki")
   const useMcpServices = sources.includes("mcpServices")
 
   const webConfigured = hasConfiguredSearchProvider(resolvedSearchConfig)
   const anyTxtConfigured = hasConfiguredAnyTxt(resolvedSearchConfig.anyTxt)
-  const deepWikiConfigured = hasConfiguredDeepWiki(resolvedSearchConfig.deepWiki)
   const mcpConfigured = hasConfiguredMcpServices(resolvedSearchConfig.mcpServices)
 
   const allResults: WebSearchResult[] = []
@@ -174,7 +171,13 @@ export async function collectResearchSources(
 
   // A selected-but-unconfigured source is a failure, not a silent skip -
   // otherwise synthesis could proceed on the other source's success and
-  // resolve a review item that never got the DeepWiki material the user asked for.
+  // resolve a review item that never got the material the user asked for.
+  //
+  // NOTE: "deepwiki" is intentionally NOT collected here. DeepWiki is now a
+  // fire-and-forget ingest channel: executeResearch triggers it via
+  // triggerDeepWikiQuery (which writes a prompt_ready record + kicks off an
+  // async search→ingest worker), and DR completes without waiting for it.
+  // DeepWiki content never enters the synthesis / query page.
   if (useWeb) {
     if (webConfigured) {
       for (const webQuery of webQueries) {
@@ -200,28 +203,10 @@ export async function collectResearchSources(
     }
   }
 
-  // DeepWiki runs concurrently with web/anytxt but its result is appended
-  // separately after settle, bypassing the 20-result cap: it is a single
-  // long-form answer, not a search hit competing for a slot.
-  let deepWikiTracked: Promise<{ source: string; results: WebSearchResult[]; error: string | null }> | null = null
-  if (useDeepWiki) {
-    if (deepWikiConfigured && options.context && options.llmConfig) {
-      deepWikiTracked = trackSourceCall(
-        "deepwiki",
-        deps.deepWikiSearch(options.context, resolvedSearchConfig.deepWiki!, options.llmConfig),
-      )
-    } else if (!deepWikiConfigured) {
-      errors.push({ source: "deepwiki", message: "DeepWiki source not configured" })
-    } else {
-      errors.push({ source: "deepwiki", message: "DeepWiki missing research context or LLM config" })
-    }
-  }
-
   // MCP services run concurrently; results appended separately after settle,
-  // bypassing the 20-result cap (long-form answers, like DeepWiki). Each
-  // enabled service must be fully configured - an enabled-but-incomplete
-  // service is a failure with its name, not a silent skip (checked inside
-  // mcpServicesSearch).
+  // bypassing the 20-result cap (long-form answers). Each enabled service
+  // must be fully configured - an enabled-but-incomplete service is a failure
+  // with its name, not a silent skip (checked inside mcpServicesSearch).
   let mcpServicesTracked: Promise<{ source: string; results: WebSearchResult[]; error: string | null }> | null = null
   if (useMcpServices) {
     if (mcpConfigured && options.context) {
@@ -242,22 +227,6 @@ export async function collectResearchSources(
       errors.push({ source: item.source, message: item.error })
     } else {
       addResults(item.results)
-    }
-  }
-
-  if (deepWikiTracked) {
-    const dw = await deepWikiTracked
-    if (dw.error) {
-      errors.push({ source: "deepwiki", message: dw.error })
-    } else {
-      // Bypass the 20-cap; just dedupe.
-      for (const r of dw.results) {
-        const key = (r.url || `${r.source}:${r.title}:${r.snippet}`).toLowerCase()
-        if (!seenUrls.has(key)) {
-          seenUrls.add(key)
-          allResults.push(r)
-        }
-      }
     }
   }
 
@@ -360,11 +329,41 @@ async function executeResearch(
       purpose,
     }
 
+    // DeepWiki is a fire-and-forget ingest channel, not a synthesis source.
+    // If selected + configured + on the active project, trigger it now: the
+    // channel assembles the prompt, writes a prompt_ready record, and kicks
+    // off an async search→ingest worker. DR does NOT wait for the worker —
+    // completion is gated on the durable record (see webResults empty branch
+    // below). A trigger failure (assembly timeout, etc.) is non-fatal for the
+    // query path: it just means DeepWiki didn't run; DR continues/aborts
+    // based on the other sources.
+    const resolvedSearchConfig = resolveSearchConfig(searchConfig)
+    const sources = resolvedSearchConfig.deepResearchSources ?? ["web"]
+    const selectedNonDeepWiki = sources.some((s) => s !== "deepwiki")
+    let deepWikiTriggered = false
+    if (
+      sources.includes("deepwiki") &&
+      resolvedSearchConfig.deepWiki &&
+      hasConfiguredDeepWiki(resolvedSearchConfig.deepWiki)
+    ) {
+      const project = useWikiStore.getState().project
+      if (project && isActiveProjectPath(pp)) {
+        try {
+          const { triggerDeepWikiQuery } = await import("@/lib/deepwiki-channel")
+          await triggerDeepWikiQuery(pp, researchContext, llmConfig, resolvedSearchConfig.deepWiki, project.id)
+          deepWikiTriggered = true
+        } catch (err) {
+          console.warn("[DeepResearch] DeepWiki channel trigger failed:", err)
+        }
+      }
+    }
+    if (!isActiveProjectPath(pp)) return
+
     const { results: allResults, errors: sourceErrors } = await collectResearchSources(
       queries,
       searchConfig,
       pp,
-      { webSearch, anyTxtSearch: anyTxtSearchSmart, deepWikiSearch, mcpServicesSearch },
+      { webSearch, anyTxtSearch: anyTxtSearchSmart, mcpServicesSearch },
       { llmConfig, context: researchContext },
     )
     if (!isActiveProjectPath(pp)) return
@@ -372,15 +371,37 @@ async function executeResearch(
     const webResults = allResults
     if (!updateTaskIfActive(pp, taskId, { webResults })) return
 
-    // Any selected source failing is fatal: abort before synthesis rather
-    // than saving a partial page and resolving the review item. This matches
-    // the "DeepWiki failure -> review item stays pending" contract.
+    // Any selected (non-DeepWiki) source failing is fatal: abort before
+    // synthesis rather than saving a partial page and resolving the review
+    // item. This matches the "any selected source failing aborts" contract
+    // for the query path. (DeepWiki is no longer collected here, so a
+    // DeepWiki assembly failure does NOT show up as a sourceError — it is
+    // surfaced as deepWikiTriggered=false and handled below.)
     if (sourceErrors.length > 0) {
       if (!updateTaskIfActive(pp, taskId, noResearchSourcesTaskPatch(sourceErrors))) return
       if (isActiveProjectPath(pp)) onTaskFinished(pp, llmConfig, searchConfig)
       return
     }
     if (webResults.length === 0) {
+      // Only DeepWiki was selected AND its prompt_ready record was written:
+      // DR completes on the durable record. The async DeepWiki worker
+      // continues independently (search → ingest → graph). No query page is
+      // produced; the review item resolves to "Researched".
+      if (!selectedNonDeepWiki && deepWikiTriggered) {
+        const reviewItemId = task?.reviewItemId
+        if (reviewItemId) {
+          try {
+            useReviewStore.getState().resolveItem(reviewItemId, "Researched")
+          } catch (err) {
+            console.warn("[DeepResearch] failed to resolve review item:", err)
+          }
+        }
+        if (!updateTaskIfActive(pp, taskId, { status: "done", savedPath: null })) return
+        if (isActiveProjectPath(pp)) onTaskFinished(pp, llmConfig, searchConfig)
+        return
+      }
+      // Otherwise (web/anytxt/mcp selected but empty, or DeepWiki-only but
+      // trigger failed) keep the existing empty-results failure.
       if (!updateTaskIfActive(pp, taskId, noResearchSourcesTaskPatch(sourceErrors))) return
       if (isActiveProjectPath(pp)) onTaskFinished(pp, llmConfig, searchConfig)
       return
