@@ -519,6 +519,20 @@ function App() {
     // to render. Each write has a stale-project guard so a fast project switch
     // cannot apply old review/lint/chat state to the new project.
     void hydrateProjectSideStores(proj)
+
+    // Resume DeepWiki queries that were mid-flight when the app closed.
+    try {
+      const { resumeDeepWikiQueries } = await import("@/lib/deepwiki-channel")
+      const { resolveSearchConfig } = await import("@/lib/web-search")
+      const searchConfig = useWikiStore.getState().searchApiConfig
+      const llmConfig = useWikiStore.getState().llmConfig
+      const resolvedSearchConfig = resolveSearchConfig(searchConfig)
+      if (resolvedSearchConfig.deepWiki) {
+        await resumeDeepWikiQueries(proj.path, llmConfig, resolvedSearchConfig.deepWiki, proj.id)
+      }
+    } catch (err) {
+      console.warn("[deepwiki] resume failed:", err)
+    }
   }
 
   async function handleSelectRecent(proj: WikiProject) {

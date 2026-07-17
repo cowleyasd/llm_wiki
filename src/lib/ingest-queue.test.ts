@@ -983,3 +983,143 @@ describe("cleanupWrittenFiles — embedding cascade", () => {
     expect(removePageEmbeddingMock).toHaveBeenCalledWith("C:/proj", "rope")
   })
 })
+
+describe("ingest-queue — onComplete callback", () => {
+  it("fires onComplete(true, writtenFiles) on success", async () => {
+    mockAutoIngest.mockResolvedValue(["wiki/sources/foo.md", "wiki/concepts/bar.md"])
+    const cb = vi.fn()
+    const id = await enqueueIngest(TEST_ID, "raw/sources/a.md", "", cb)
+    await flushMicrotasks(10)
+
+    expect(cb).toHaveBeenCalledOnce()
+    expect(cb).toHaveBeenCalledWith(true, ["wiki/sources/foo.md", "wiki/concepts/bar.md"], undefined)
+    // Callback map entry is cleaned up after firing.
+    expect(id).toMatch(/^ingest-/)
+  })
+
+  it("fires onComplete(false, [], message) after retries are exhausted", async () => {
+    mockAutoIngest.mockRejectedValue(new Error("LLM error"))
+    const cb = vi.fn()
+    await enqueueIngest(TEST_ID, "bad.md", "", cb)
+    await flushMicrotasks(30)
+
+    expect(cb).toHaveBeenCalledOnce()
+    expect(cb).toHaveBeenCalledWith(false, [], "LLM error")
+  })
+
+  it("does NOT fire onComplete while a task is still retrying (non-terminal)", async () => {
+    // Fail twice then succeed: callback should fire only once (on success).
+    mockAutoIngest
+      .mockRejectedValueOnce(new Error("e1"))
+      .mockRejectedValueOnce(new Error("e2"))
+      .mockResolvedValueOnce(["wiki/sources/foo.md"])
+    const cb = vi.fn()
+    await enqueueIngest(TEST_ID, "flaky.md", "", cb)
+    await flushMicrotasks(30)
+
+    expect(mockAutoIngest).toHaveBeenCalledTimes(3)
+    expect(cb).toHaveBeenCalledOnce()
+    expect(cb).toHaveBeenCalledWith(true, ["wiki/sources/foo.md"], undefined)
+  })
+
+  it("fires onComplete(false, [], 'cancelled') on cancelTask of a pending task", async () => {
+    // Block processing so the task stays pending until we cancel it.
+    mockAutoIngest.mockImplementation(() => new Promise(() => {}))
+    const cb = vi.fn()
+    const id = await enqueueIngest(TEST_ID, "cancelme.md", "", cb)
+    await flushMicrotasks(2)
+    await cancelTask(id)
+    expect(cb).toHaveBeenCalledWith(false, [], "cancelled")
+  })
+
+  it("cancelTask on a task with no callback is a no-op (does not throw)", async () => {
+    mockAutoIngest.mockImplementation(() => new Promise(() => {}))
+    const id = await enqueueIngest(TEST_ID, "nocb-cancel.md")
+    await flushMicrotasks(2)
+    await expect(cancelTask(id)).resolves.toBeUndefined()
+  })
+
+  it("fires onComplete(false, [], 'cancelled') for each removed task on cancelAllTasks", async () => {
+    mockAutoIngest.mockImplementation(() => new Promise(() => {}))
+    const cbA = vi.fn()
+    const cbB = vi.fn()
+    await enqueueIngest(TEST_ID, "a.md", "", cbA)
+    await enqueueIngest(TEST_ID, "b.md", "", cbB)
+    await flushMicrotasks(2)
+
+    const removed = await cancelAllTasks()
+    expect(removed).toBeGreaterThanOrEqual(2)
+    expect(cbA).toHaveBeenCalledWith(false, [], "cancelled")
+    expect(cbB).toHaveBeenCalledWith(false, [], "cancelled")
+  })
+
+  it("fires onComplete(false, [], error) on project-not-found early exit", async () => {
+    // Force getProjectPathById to return null for the active project so
+    // processNext hits the "Project not found in registry" early-exit.
+    const { getProjectPathById } = await import("@/lib/project-identity")
+    const mockGetPath = vi.mocked(getProjectPathById)
+    mockGetPath.mockReset()
+    mockGetPath.mockResolvedValue(null)
+
+    const cb = vi.fn()
+    await enqueueIngest(TEST_ID, "orphan.md", "", cb)
+    await flushMicrotasks(10)
+
+    expect(cb).toHaveBeenCalledOnce()
+    expect(cb).toHaveBeenCalledWith(false, [], expect.stringMatching(/project not found/i))
+
+    // Restore the default mock for subsequent tests.
+    mockGetPath.mockReset()
+    mockGetPath.mockImplementation(async (id: string) => idToPath[id] ?? null)
+  })
+
+  it("fires onComplete(false, [], error) on LLM-not-configured early exit", async () => {
+    // Clear the LLM config so hasUsableLlm returns false.
+    useWikiStore.getState().setLlmConfig({
+      provider: "openai",
+      apiKey: "",
+      model: "",
+      ollamaUrl: "",
+      customEndpoint: "",
+      maxContextSize: 0,
+    })
+    const cb = vi.fn()
+    await enqueueIngest(TEST_ID, "nollm.md", "", cb)
+    await flushMicrotasks(10)
+
+    expect(cb).toHaveBeenCalledOnce()
+    expect(cb).toHaveBeenCalledWith(false, [], expect.stringMatching(/LLM not configured/i))
+
+    // Restore a usable config for subsequent tests.
+    useWikiStore.getState().setLlmConfig({
+      provider: "openai",
+      apiKey: "test-key",
+      model: "gpt-4",
+      ollamaUrl: "",
+      customEndpoint: "",
+      maxContextSize: 128000,
+    })
+  })
+
+  it("a thrown callback does not break the queue loop", async () => {
+    mockAutoIngest.mockResolvedValue(["wiki/sources/foo.md"])
+    const throwingCb = vi.fn(() => {
+      throw new Error("callback bug")
+    })
+    await enqueueIngest(TEST_ID, "ok.md", "", throwingCb)
+    await flushMicrotasks(10)
+
+    // The queue still completed the task despite the callback throwing.
+    expect(throwingCb).toHaveBeenCalledOnce()
+    expect(getQueueSummary()).toMatchObject({ completed: 1, total: 1 })
+  })
+
+  it("works without a callback (backwards-compatible call signature)", async () => {
+    mockAutoIngest.mockResolvedValue(["wiki/sources/foo.md"])
+    // 3-arg call, no onComplete — must not throw.
+    const id = await enqueueIngest(TEST_ID, "nocb.md")
+    await flushMicrotasks(10)
+    expect(id).toMatch(/^ingest-/)
+    expect(getQueueSummary()).toMatchObject({ completed: 1, total: 1 })
+  })
+})

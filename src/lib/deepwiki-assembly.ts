@@ -132,12 +132,13 @@ export function templateAssembly(context: ResearchContext): string {
  * Assembly failure is NON-fatal: if the LLM throws, reports an error,
  * returns empty, or produces unparseable output, we fall back to
  * {@link templateAssembly}. A real DeepWiki HTTP/timeout failure is fatal
- * and handled by the caller ({@link deepWikiSearch}).
+ * and handled by the caller.
  */
 export async function assembleDeepWikiPrompt(
   llmConfig: LlmConfig,
   context: ResearchContext,
   assemblyInstruction: string,
+  signal?: AbortSignal,
 ): Promise<{ prompt: string; fellBack: boolean }> {
   const instruction = assemblyInstruction.trim() || DEFAULT_ASSEMBLY_INSTRUCTION
 
@@ -173,8 +174,24 @@ export async function assembleDeepWikiPrompt(
         onDone: () => {},
         onError: (err) => { streamError = err },
       },
+      signal,
     )
+    // streamChat does NOT throw on abort — it calls onDone() and returns
+    // normally (llm-client.ts:129-141), leaving `output` empty, which would
+    // silently fall back to the template. A real timeout must be a hard
+    // failure, so check the signal explicitly and throw AbortError.
+    if (signal?.aborted) {
+      throw new DOMException("assembly aborted", "AbortError")
+    }
   } catch (err) {
+    // AbortError is a hard failure (timeout) — rethrow, do NOT template-fall
+    // back. Other errors keep the existing fallback behavior.
+    if (
+      err instanceof Error &&
+      (err.name === "AbortError" || (err as DOMException)?.code === DOMException.ABORT_ERR)
+    ) {
+      throw err
+    }
     streamError = err instanceof Error ? err : new Error(String(err))
   }
 

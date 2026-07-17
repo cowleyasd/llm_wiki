@@ -1,7 +1,4 @@
-import { invoke } from "@tauri-apps/api/core"
-import type { DeepWikiSourceConfig, LlmConfig } from "@/stores/wiki-store"
-import type { WebSearchResult } from "./web-search"
-import { assembleDeepWikiPrompt, type ResearchContext } from "./deepwiki-assembly"
+import type { DeepWikiSourceConfig } from "@/stores/wiki-store"
 
 // No hardcoded defaults for connection details — the user must supply their
 // own DeepWiki base URL, space ID, model, branch, token, and a positive
@@ -54,44 +51,4 @@ export function hasConfiguredDeepWiki(config?: DeepWikiSourceConfig): boolean {
 export interface DeepWikiSearchResult {
   content: string
   spaceUrl: string
-}
-
-/**
- * Assemble a DeepWiki prompt from the research context, then query the
- * DeepWiki knowledge base via the Rust direct-HTTP command.
- *
- * Assembly failure is non-fatal (falls back to a template prompt). A
- * DeepWiki HTTP/timeout/config/parse failure **rejects** (throws) so that
- * `collectResearchSources`'s `Promise.allSettled` records it as a structured
- * source error and `executeResearch` aborts before synthesis.
- */
-export async function deepWikiSearch(
-  context: ResearchContext,
-  config: DeepWikiSourceConfig,
-  llmConfig: LlmConfig,
-): Promise<WebSearchResult[]> {
-  const resolved = normalizeDeepWikiConfig(config)
-  if (!resolved.enabled) {
-    throw new Error("DeepWiki source is disabled")
-  }
-
-  const { prompt } = await assembleDeepWikiPrompt(llmConfig, context, resolved.assemblyInstruction)
-
-  const result = await invoke<DeepWikiSearchResult>("deepwiki_search", {
-    prompt,
-    config: resolved,
-  })
-
-  if (!result.content?.trim()) {
-    throw new Error("DeepWiki returned an empty response")
-  }
-
-  return [
-    {
-      title: `DeepWiki: ${context.topic}`,
-      url: result.spaceUrl,
-      snippet: result.content,
-      source: "DeepWiki",
-    },
-  ]
 }

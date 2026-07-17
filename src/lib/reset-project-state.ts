@@ -14,6 +14,7 @@ import { useLintStore } from "@/stores/lint-store"
 import { useActivityStore } from "@/stores/activity-store"
 import { useResearchStore } from "@/stores/research-store"
 import { useWikiStore } from "@/stores/wiki-store"
+import { useDeepWikiStore } from "@/stores/deepwiki-store"
 
 export async function resetProjectState(): Promise<void> {
   // Zustand stores — clear all per-project data (synchronous)
@@ -52,6 +53,11 @@ export async function resetProjectState(): Promise<void> {
 
   useResearchStore.setState({
     tasks: [],
+    panelOpen: false,
+  })
+
+  useDeepWikiStore.setState({
+    records: [],
     panelOpen: false,
   })
 
