@@ -1,17 +1,19 @@
 import { useState, useEffect } from "react"
 import {
-  FileText, FolderOpen, Search, Network, ClipboardCheck, Settings, ArrowLeftRight, ClipboardList, Globe, MessageSquare, Sparkles,
+  FileText, FolderOpen, Search, Network, ClipboardCheck, Settings, ArrowLeftRight, ClipboardList, Globe, MessageSquare, Sparkles, BookOpen,
 } from "lucide-react"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
 import { useWikiStore } from "@/stores/wiki-store"
 import { useReviewStore } from "@/stores/review-store"
 import { useResearchStore } from "@/stores/research-store"
+import { useDeepWikiStore } from "@/stores/deepwiki-store"
 import { useUpdateStore, hasAvailableUpdate } from "@/stores/update-store"
 import { useTranslation } from "react-i18next"
 import logoImg from "@/assets/logo.jpg"
 import type { WikiState } from "@/stores/wiki-store"
 import {
   isResearchPanelVisible,
+  isStandaloneView,
   nextResearchPanelNavState,
 } from "./research-panel-nav"
 
@@ -39,6 +41,9 @@ export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
   const researchPanelOpen = useResearchStore((s) => s.panelOpen)
   const researchActiveCount = useResearchStore((s) => s.tasks.filter((t) => t.status !== "done" && t.status !== "error").length)
   const toggleResearchPanel = useResearchStore((s) => s.setPanelOpen)
+  const deepWikiPanelOpen = useDeepWikiStore((s) => s.panelOpen)
+  const deepWikiActiveCount = useDeepWikiStore((s) => s.records.filter((r) => r.status === "prompt_ready" || r.status === "searching").length)
+  const toggleDeepWikiPanel = useDeepWikiStore((s) => s.setPanelOpen)
   // Use `hasAvailableUpdate` (ignores dismiss state) rather than
   // `shouldShowUpdateBanner`. The dot is a passive signpost — it
   // should keep marking the gear as long as the update exists, even
@@ -69,6 +74,17 @@ export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
     const next = nextResearchPanelNavState(activeView, researchPanelOpen)
     if (next.activeView !== activeView) setActiveView(next.activeView)
     toggleResearchPanel(next.researchPanelOpen)
+    // Opening Research closes DeepWiki so only one right panel is active.
+    if (next.researchPanelOpen) toggleDeepWikiPanel(false)
+  }
+
+  function handleDeepWikiPanelToggle() {
+    // Same nav pattern as Research: leave a non-standalone view in
+    // place, just flip the panel. Opening DeepWiki closes Research.
+    if (isStandaloneView(activeView)) setActiveView("wiki")
+    const next = !deepWikiPanelOpen
+    toggleDeepWikiPanel(next)
+    if (next) toggleResearchPanel(false)
   }
 
   return (
@@ -125,6 +141,25 @@ export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
               )}
             </TooltipTrigger>
             <TooltipContent side="right">{t("research.title")}</TooltipContent>
+          </Tooltip>
+          {/* DeepWiki queries — same row, distinct panel */}
+          <Tooltip>
+            <TooltipTrigger
+              onClick={handleDeepWikiPanelToggle}
+              className={`relative flex h-10 w-10 items-center justify-center rounded-md transition-colors ${
+                deepWikiPanelOpen && !isStandaloneView(activeView)
+                  ? "bg-accent text-accent-foreground"
+                  : "text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground"
+              }`}
+            >
+              <BookOpen className="h-5 w-5" />
+              {deepWikiActiveCount > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-purple-500 px-1 text-[10px] font-bold text-white">
+                  {deepWikiActiveCount}
+                </span>
+              )}
+            </TooltipTrigger>
+            <TooltipContent side="right">{t("deepwiki.title", "DeepWiki Queries")}</TooltipContent>
           </Tooltip>
           <Tooltip>
             <TooltipTrigger

@@ -1068,6 +1068,17 @@
       "other": "其他"
     }
   },
+  "deepwiki": {
+    "title": "DeepWiki 查询",
+    "empty": "暂无 DeepWiki 查询。在深度研究中勾选 DeepWiki 后触发。",
+    "statusPromptReady": "准备中",
+    "statusSearching": "查询 DeepWiki 中",
+    "statusIngested": "已加入提取队列",
+    "statusFailed": "失败",
+    "retry": "重试",
+    "topic": "主题",
+    "error": "错误"
+  },
   "time": {
     "justNow": "刚刚",
     "minutesAgo": "{{count}} 分钟前",

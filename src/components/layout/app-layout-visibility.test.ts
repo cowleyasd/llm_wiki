@@ -5,34 +5,46 @@ describe("getAppLayoutVisibility", () => {
   it("keeps chat standalone without project side panels", () => {
     // Chat owns its conversation list and reference preview area. It must not
     // also inherit the project knowledge/file panel used by workspace views.
-    expect(getAppLayoutVisibility("chat", true)).toEqual({
+    expect(getAppLayoutVisibility("chat", true, false)).toEqual({
       showLeftPanel: false,
       hasRightPanel: false,
     })
   })
 
   it("keeps settings as a standalone view even when research panel is open", () => {
-    expect(getAppLayoutVisibility("settings", true)).toEqual({
+    expect(getAppLayoutVisibility("settings", true, false)).toEqual({
       showLeftPanel: false,
       hasRightPanel: false,
     })
   })
 
   it("keeps skills as a standalone management view", () => {
-    expect(getAppLayoutVisibility("skills", true)).toEqual({
+    expect(getAppLayoutVisibility("skills", true, false)).toEqual({
       showLeftPanel: false,
       hasRightPanel: false,
     })
   })
 
   it("shows the project side panel and optional research panel in workspace views", () => {
-    expect(getAppLayoutVisibility("wiki", false)).toEqual({
+    expect(getAppLayoutVisibility("wiki", false, false)).toEqual({
       showLeftPanel: true,
       hasRightPanel: false,
     })
-    expect(getAppLayoutVisibility("search", true)).toEqual({
+    expect(getAppLayoutVisibility("search", true, false)).toEqual({
       showLeftPanel: true,
       hasRightPanel: true,
+    })
+  })
+
+  it("shows the right panel when the DeepWiki panel is open", () => {
+    expect(getAppLayoutVisibility("wiki", false, true)).toEqual({
+      showLeftPanel: true,
+      hasRightPanel: true,
+    })
+    // Standalone views still hide the right panel even with DeepWiki open.
+    expect(getAppLayoutVisibility("chat", false, true)).toEqual({
+      showLeftPanel: false,
+      hasRightPanel: false,
     })
   })
 })
