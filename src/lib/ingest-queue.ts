@@ -21,6 +21,20 @@ export interface IngestTask {
   retryCount: number
 }
 
+/** Optional completion callback for enqueueIngest. Invoked exactly once
+ *  when a task reaches a terminal state (done / failed / cancelled).
+ *  - `success=true, writtenFiles=[...]`: ingest completed, files written.
+ *  - `success=false, writtenFiles=[], error=...`: failed / cancelled / early-exit.
+ *
+ *  Stored in an in-memory Map only (functions aren't serializable, so it
+ *  never enters the persisted queue file). Lost on app restart; callers
+ *  that need durable status must track it themselves (see deepwiki-channel). */
+export type IngestCompleteCallback = (
+  success: boolean,
+  writtenFiles: string[],
+  error?: string,
+) => void
+
 // ── State ─────────────────────────────────────────────────────────────────
 
 let queue: IngestTask[] = []
@@ -48,6 +62,34 @@ let currentProjectPath = ""
 let currentAbortController: AbortController | null = null
 let lastWrittenFiles: string[] = []  // track files written by current ingest for cleanup
 let completedSinceIdle = 0
+
+/** In-memory registry of per-task onComplete callbacks. NOT persisted
+ *  (functions aren't JSON-serializable). Keyed by task id; entry is
+ *  deleted by dispatchOnComplete the moment the callback fires, so a
+ *  leak only happens if a task is silently dropped without hitting a
+ *  terminal path. All terminal paths (done / failed / cancelled /
+ *  early-exit) go through dispatchOnComplete to guarantee this. */
+const onCompleteCallbacks = new Map<string, IngestCompleteCallback>()
+
+/** Invoke + drop the callback for `taskId` if one was registered. Safe to
+ *  call from every terminal path — no-op when no callback is registered
+ *  (the common case: enqueueIngest is called without onComplete). */
+function dispatchOnComplete(
+  taskId: string,
+  success: boolean,
+  writtenFiles: string[],
+  error?: string,
+): void {
+  const cb = onCompleteCallbacks.get(taskId)
+  if (!cb) return
+  onCompleteCallbacks.delete(taskId)
+  try {
+    cb(success, writtenFiles, error)
+  } catch (err) {
+    // A buggy callback must never break the queue loop.
+    console.warn(`[Ingest Queue] onComplete callback for ${taskId} threw:`, err)
+  }
+}
 // Track whether any task has been processed since the last drain.
 // Prevents the sweep from running on every idle/no-op call.
 let processedSinceDrain = false
@@ -209,11 +251,16 @@ export async function cleanupWrittenFiles(
  * Add a file to the ingest queue. The project MUST be the currently-
  * active project — switching first is a prerequisite. Returns the new
  * task's id.
+ *
+ * Optional `onComplete` fires exactly once when the task reaches a
+ * terminal state (done / failed / cancelled). Not persisted — lost on
+ * app restart. See {@link IngestCompleteCallback}.
  */
 export async function enqueueIngest(
   projectId: string,
   sourcePath: string,
   folderContext: string = "",
+  onComplete?: IngestCompleteCallback,
 ): Promise<string> {
   if (!currentProjectId || currentProjectId !== projectId) {
     throw new Error(
@@ -222,6 +269,7 @@ export async function enqueueIngest(
   }
 
   const id = upsertQueuedIngestTask(projectId, sourcePath, folderContext)
+  if (onComplete) onCompleteCallbacks.set(id, onComplete)
   await saveQueue(currentProjectPath)
 
   processNext(currentProjectId)
@@ -331,6 +379,7 @@ export async function cancelTask(taskId: string): Promise<void> {
   await saveQueue(currentProjectPath)
   console.log(`[Ingest Queue] Cancelled: ${task.sourcePath}`)
 
+  dispatchOnComplete(taskId, false, [], "cancelled")
   processNext(currentProjectId)
 }
 
@@ -363,16 +412,24 @@ export async function cancelAllTasks(): Promise<number> {
   }
 
   const before = queue.length
+  const removedTasks: IngestTask[] = []
   for (const task of queue) {
     if (task.status !== "failed") restoredPausedTaskIds.delete(task.id)
   }
-  queue = queue.filter((t) => t.status === "failed")
+  const survivors = queue.filter((t) => t.status === "failed")
+  for (const t of queue) {
+    if (!survivors.includes(t)) removedTasks.push(t)
+  }
+  queue = survivors
   paused = false
   clearUsageLimitAutoResume()
   const removed = before - queue.length
 
   await saveQueue(currentProjectPath)
   console.log(`[Ingest Queue] Cancelled all: ${removed} tasks removed`)
+  for (const t of removedTasks) {
+    dispatchOnComplete(t.id, false, [], "cancelled")
+  }
   return removed
 }
 
@@ -485,6 +542,7 @@ export function clearQueueState(): void {
   sweepAbortController = null
   lastWrittenFiles = []
   processedSinceDrain = false
+  onCompleteCallbacks.clear()
   resetQueueAccounting()
 }
 
@@ -533,6 +591,10 @@ export async function pauseQueue(): Promise<void> {
   currentProjectPath = ""
   lastWrittenFiles = []
   processedSinceDrain = false
+  // In-memory callbacks don't survive project switch. Pending tasks are
+  // persisted to disk and re-run on restore, but their DeepWiki records
+  // will stay in `ingested` (acceptable boundary — see plan §4).
+  onCompleteCallbacks.clear()
   resetQueueAccounting()
 }
 
@@ -705,6 +767,7 @@ async function processNext(projectId: string): Promise<void> {
     next.status = "failed"
     next.error = "Project not found in registry (was it deleted?)"
     await saveQueue(currentProjectPath)
+    dispatchOnComplete(next.id, false, [], next.error ?? undefined)
     processNext(projectId)
     return
   }
@@ -723,6 +786,7 @@ async function processNext(projectId: string): Promise<void> {
     next.error = "LLM not configured — set API key in Settings"
     processing = false
     await saveQueue(pp)
+    dispatchOnComplete(next.id, false, [], next.error ?? undefined)
     processNext(projectId)
     return
   }
@@ -774,6 +838,7 @@ async function processNext(projectId: string): Promise<void> {
     await saveQueue(pp)
 
     console.log(`[Ingest Queue] Done: ${next.sourcePath}`)
+    dispatchOnComplete(next.id, true, writtenFiles, undefined)
   } catch (err) {
     if (currentProjectId !== projectId) return
     currentAbortController = null
@@ -808,12 +873,13 @@ async function processNext(projectId: string): Promise<void> {
     if (next.retryCount >= MAX_RETRIES) {
       next.status = "failed"
       console.log(`[Ingest Queue] Failed (${next.retryCount}x): ${next.sourcePath} — ${message}`)
+      await saveQueue(pp)
+      dispatchOnComplete(next.id, false, [], message)
     } else {
-      next.status = "pending" // will retry
+      next.status = "pending" // will retry — NOT a terminal state; callback stays registered.
       console.log(`[Ingest Queue] Error (retry ${next.retryCount}/${MAX_RETRIES}): ${next.sourcePath} — ${message}`)
+      await saveQueue(pp)
     }
-
-    await saveQueue(pp)
   }
 
   processing = false

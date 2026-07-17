@@ -25,8 +25,15 @@ async function patchRecord(
 
 /**
  * Async worker: search DeepWiki with the record's stored prompt, write source
- * file, enqueue for ingest. Updates record status through searching -> ingested/failed.
- * Does NOT track autoIngest internal progress (ingest-queue owns that).
+ * file, enqueue for ingest. Updates record status through
+ * searching -> ingested -> graphed/failed.
+ *
+ * The `graphed` transition is driven by enqueueIngest's onComplete
+ * callback (fires when the ingest-queue task reaches a terminal state).
+ * Order matters: we `await patchRecord(ingested)` BEFORE enqueue so the
+ * non-terminal `ingested` is durably on disk first; the terminal-state
+ * guard in mutateRecord then protects `graphed` from being clobbered by
+ * any late `ingested` patch.
  */
 export async function runDeepWikiQueryRecord(
   projectPath: string,
@@ -47,8 +54,19 @@ export async function runDeepWikiQueryRecord(
     }
     const srcPath = sourceFilePath(projectPath, record.id)
     await writeFileAtomic(srcPath, result.content)
-    await enqueueIngest(projectId, srcPath, "")
+    // 1. Durably persist `ingested` first so the terminal guard has
+    //    something non-terminal to upgrade from.
     await patchRecord(projectPath, record.id, { status: "ingested" })
+    // 2. Enqueue with a completion callback. The callback may fire
+    //    synchronously (early-exit failures) or much later (after
+    //    autoIngest finishes). The terminal guard ensures `graphed` /
+    //    `failed` written here cannot be regressed by a stray `ingested`.
+    await enqueueIngest(projectId, srcPath, "", (success, _writtenFiles, error) => {
+      void patchRecord(projectPath, record.id, {
+        status: success ? "graphed" : "failed",
+        error: success ? null : (error ?? "ingest failed"),
+      })
+    })
   } catch (err) {
     await patchRecord(projectPath, record.id, {
       status: "failed",
@@ -141,7 +159,22 @@ export async function resumeDeepWikiQueries(
   }
 }
 
-export type DeepWikiQueryStatus = "prompt_ready" | "searching" | "ingested" | "failed"
+export type DeepWikiQueryStatus =
+  | "prompt_ready"
+  | "searching"
+  | "ingested"
+  | "graphed"
+  | "failed"
+
+/** Terminal states — once reached, they cannot be overwritten by a
+ *  non-terminal status (searching/ingested/prompt_ready). Guards against
+ *  the race where enqueueIngest's async onComplete (graphed) fires
+ *  before a late patchRecord(ingested) lands, which would otherwise
+ *  regress a finished record back to "queued". */
+const TERMINAL_STATUSES: ReadonlySet<DeepWikiQueryStatus> = new Set(["graphed", "failed"])
+function isTerminalStatus(s: DeepWikiQueryStatus): boolean {
+  return TERMINAL_STATUSES.has(s)
+}
 
 export interface DeepWikiQueryRecord {
   /** Stable unique id; source file is named deepwiki-<id>.md so retries overwrite. */
@@ -221,6 +254,13 @@ export async function saveDeepWikiRecords(projectPath: string, records: DeepWiki
 /**
  * Atomically update one record: load all, replace by id, persist. Whole RMW
  * inside the per-project lock so concurrent updates don't lose data.
+ *
+ * Terminal-state guard: if the existing record is already in a terminal
+ * state (graphed/failed), a patch whose `status` would move it back to a
+ * non-terminal state (searching/ingested/prompt_ready) has its `status`
+ * field dropped. This prevents the enqueueIngest→onComplete race from
+ * regressing a finished record. Patches without a `status` field, and
+ * patches that keep/enter a terminal state, apply normally.
  */
 export async function mutateRecord(
   projectPath: string,
@@ -231,7 +271,17 @@ export async function mutateRecord(
     const records = await loadDeepWikiRecords(projectPath)
     const idx = records.findIndex((r) => r.id === id)
     if (idx < 0) return null
-    records[idx] = { ...records[idx], ...patch }
+    const current = records[idx]
+    const applied: Partial<DeepWikiQueryRecord> = { ...patch }
+    if (
+      patch.status !== undefined &&
+      isTerminalStatus(current.status) &&
+      !isTerminalStatus(patch.status)
+    ) {
+      // Reject the status downgrade; keep all other patch fields.
+      delete applied.status
+    }
+    records[idx] = { ...current, ...applied }
     await writeRecordsRaw(projectPath, records)
     return records[idx]
   })

@@ -1074,6 +1074,7 @@
     "statusPromptReady": "Preparing",
     "statusSearching": "Querying DeepWiki",
     "statusIngested": "Queued for ingest",
+    "statusGraphed": "Ingested into graph",
     "statusFailed": "Failed",
     "retry": "Retry",
     "topic": "Topic",

@@ -1074,6 +1074,7 @@
     "statusPromptReady": "准备中",
     "statusSearching": "查询 DeepWiki 中",
     "statusIngested": "已加入提取队列",
+    "statusGraphed": "已入图",
     "statusFailed": "失败",
     "retry": "重试",
     "topic": "主题",

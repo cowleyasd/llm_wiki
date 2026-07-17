@@ -97,7 +97,9 @@ describe("runDeepWikiQueryRecord", () => {
     const writtenPath = (writeFileAtomic as any).mock.calls.find((c: any[]) => c[0].includes(`deepwiki-${record.id}.md`))?.[0] as string
     expect(writtenPath).toContain(`deepwiki-${record.id}.md`)
     expect((writeFileAtomic as any).mock.calls.find((c: any[]) => c[0] === writtenPath)?.[1]).toBe("DeepWiki answer body")
-    expect(enqueueIngest).toHaveBeenCalledWith("proj-1", writtenPath, "")
+    // enqueueIngest now takes a 4th onComplete callback; assert on the
+    // first three positional args and that a function was passed.
+    expect(enqueueIngest).toHaveBeenCalledWith("proj-1", writtenPath, "", expect.any(Function))
   })
 
   it("empty content -> failed, no source written, no enqueue", async () => {
@@ -125,6 +127,96 @@ describe("runDeepWikiQueryRecord", () => {
     const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
     expect(persisted.status).toBe("failed")
     expect(persisted.error).toMatch(/timeout/)
+  })
+})
+
+describe("runDeepWikiQueryRecord — ingest onComplete → graphed/failed + terminal guard", () => {
+  it("onComplete(success) transitions ingested -> graphed", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    const { enqueueIngest } = await import("@/lib/ingest-queue")
+    ;(invoke as any).mockResolvedValue({ content: "body", spaceUrl: "" })
+    // Capture the onComplete callback so the test can fire it after enqueue.
+    let capturedCb: ((success: boolean, files: string[], error?: string) => void) | null = null
+    ;(enqueueIngest as any).mockImplementation(
+      async (_p: string, _s: string, _f: string, cb?: (s: boolean, f: string[], e?: string) => void) => {
+        capturedCb = cb ?? null
+        return "task-1"
+      },
+    )
+
+    const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
+    await appendRecord(tmpDir!, record)
+    await runDeepWikiQueryRecord(tmpDir!, record, {} as any, {} as any, "proj-1")
+
+    // Before the ingest callback fires, the record stays at ingested.
+    expect((await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!.status).toBe("ingested")
+    expect(capturedCb).not.toBeNull()
+    capturedCb!(true, ["wiki/sources/foo.md"], undefined)
+    // patchRecord is async; let it settle.
+    await new Promise((r) => setTimeout(r, 10))
+
+    const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(persisted.status).toBe("graphed")
+    expect(persisted.error).toBeNull()
+  })
+
+  it("onComplete(failure) transitions ingested -> failed with error", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    const { enqueueIngest } = await import("@/lib/ingest-queue")
+    ;(invoke as any).mockResolvedValue({ content: "body", spaceUrl: "" })
+    let capturedCb: ((success: boolean, files: string[], error?: string) => void) | null = null
+    ;(enqueueIngest as any).mockImplementation(
+      async (_p: string, _s: string, _f: string, cb?: (s: boolean, f: string[], e?: string) => void) => {
+        capturedCb = cb ?? null
+        return "task-1"
+      },
+    )
+
+    const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
+    await appendRecord(tmpDir!, record)
+    await runDeepWikiQueryRecord(tmpDir!, record, {} as any, {} as any, "proj-1")
+    capturedCb!(false, [], "ingest failed")
+    await new Promise((r) => setTimeout(r, 10))
+
+    const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(persisted.status).toBe("failed")
+    expect(persisted.error).toBe("ingest failed")
+  })
+
+  it("terminal guard: graphed is not regressed by a late ingested patch", async () => {
+    const { mutateRecord } = await import("./deepwiki-channel")
+    const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
+    await appendRecord(tmpDir!, record)
+    // Move to ingested, then to graphed (terminal).
+    await mutateRecord(tmpDir!, record.id, { status: "ingested" })
+    await mutateRecord(tmpDir!, record.id, { status: "graphed" })
+    // A late `ingested` patch (e.g. from a racing async callback) must NOT
+    // downgrade the terminal `graphed` status.
+    const updated = await mutateRecord(tmpDir!, record.id, { status: "ingested" })
+    expect(updated!.status).toBe("graphed")
+    // Non-status patches still apply on a terminal record.
+    const updated2 = await mutateRecord(tmpDir!, record.id, { error: "stale" })
+    expect(updated2!.status).toBe("graphed")
+    expect(updated2!.error).toBe("stale")
+  })
+
+  it("terminal guard: failed is not regressed by a searching patch", async () => {
+    const { mutateRecord } = await import("./deepwiki-channel")
+    const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
+    await appendRecord(tmpDir!, record)
+    await mutateRecord(tmpDir!, record.id, { status: "failed", error: "boom" })
+    const updated = await mutateRecord(tmpDir!, record.id, { status: "searching", error: null })
+    expect(updated!.status).toBe("failed")
+    expect(updated!.error).toBeNull() // non-status fields still apply
+  })
+
+  it("terminal -> terminal transition is allowed (graphed -> failed)", async () => {
+    const { mutateRecord } = await import("./deepwiki-channel")
+    const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
+    await appendRecord(tmpDir!, record)
+    await mutateRecord(tmpDir!, record.id, { status: "graphed" })
+    const updated = await mutateRecord(tmpDir!, record.id, { status: "failed", error: "post-hoc" })
+    expect(updated!.status).toBe("failed")
   })
 })
 

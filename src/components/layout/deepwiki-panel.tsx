@@ -64,6 +64,13 @@ export function DeepWikiPanel() {
 
 function StatusBadge({ status }: { status: string }) {
   const { t } = useTranslation()
+  if (status === "graphed")
+    return (
+      <span className="flex shrink-0 items-center gap-1 text-emerald-600">
+        <CheckCircle2 className="h-3.5 w-3.5" />
+        {t("deepwiki.statusGraphed")}
+      </span>
+    )
   if (status === "ingested")
     return (
       <span className="flex shrink-0 items-center gap-1 text-emerald-500">
