@@ -21,6 +21,7 @@ function ctxFor(overrides: Partial<DeepWikiSourceConfig> = {}, projectId = "proj
       ...overrides,
     } as DeepWikiSourceConfig,
     maxConcurrent: overrides.maxConcurrent ?? 3,
+    reuseSessions: overrides.reuseSessions ?? false,
   }
 }
 
@@ -357,5 +358,59 @@ describe("concurrency limiter", () => {
     expect((invoke as any).mock.calls).toHaveLength(4)
     expect(final.filter((r) => r.status === "failed")).toHaveLength(0)
     expect(final.filter((r) => r.status === "ingested")).toHaveLength(4)
+  })
+})
+
+describe("reuseSessions: fixed session pool + slot binding", () => {
+  it("reuses at most maxConcurrent distinct session ids, bound to slots", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    // Block each invoke so we can observe concurrent session assignment.
+    const releaseQueue: Array<() => void> = []
+    ;(invoke as any).mockImplementation(() =>
+      new Promise((resolve) => {
+        releaseQueue.push(() => resolve({ content: "answer", spaceUrl: "" }))
+      }),
+    )
+
+    // 5 records, reuseSessions=true, maxConcurrent=2 → only 2 distinct session ids.
+    const records = Array.from({ length: 5 }, (_, i) =>
+      createDeepWikiRecord({ topic: `t${i}`, prompt: `p${i}` }),
+    )
+    await saveDeepWikiRecords(tmpDir!, records)
+    const c = ctxFor({ maxConcurrent: 2, reuseSessions: true })
+    void processDeepWikiQueue(c).catch(() => {})
+    await new Promise((r) => setTimeout(r, 30))
+
+    // 2 in flight → 2 distinct session ids assigned (slot 0 and slot 1).
+    const inflight = (invoke as any).mock.calls
+      .filter((c: any[]) => c[1]?.sessionId !== undefined)
+      .map((c: any[]) => c[1].sessionId)
+    expect(new Set(inflight).size).toBe(2)
+    // The records claimed have slotIdx 0 and 1.
+    const claimed = (await loadDeepWikiRecords(tmpDir!)).filter((r) => r.status === "searching")
+    expect(claimed.map((r) => r.slotIdx).sort()).toEqual([0, 1])
+
+    // Release all; every invoke must carry one of the same 2 session ids.
+    for (let i = 0; i < 20 && releaseQueue.length; i++) {
+      while (releaseQueue.length) releaseQueue.shift()!()
+      await new Promise((r) => setTimeout(r, 30))
+    }
+    await new Promise((r) => setTimeout(r, 40))
+    const allSessionIds = (invoke as any).mock.calls
+      .map((c: any[]) => c[1]?.sessionId)
+      .filter((s: unknown): s is string => typeof s === "string")
+    expect(new Set(allSessionIds).size).toBe(2)
+  })
+
+  it("reuseSessions=false does not pass a sessionId (Rust generates UUID)", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    ;(invoke as any).mockResolvedValue({ content: "answer", spaceUrl: "" })
+    const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
+    await saveDeepWikiRecords(tmpDir!, [record])
+    const c = ctxFor({ reuseSessions: false })
+    void processDeepWikiQueue(c).catch(() => {})
+    await new Promise((r) => setTimeout(r, 40))
+    const passed = (invoke as any).mock.calls[0]?.[1]
+    expect(passed?.sessionId).toBeUndefined()
   })
 })

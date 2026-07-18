@@ -718,7 +718,8 @@
         "mcpNotConfigured": "at least one enabled service needs endpoint + toolName",
         "mcpJsonPlaceholder": "Paste a JSON array of MCP service configs",
         "mcpJsonError": "Invalid JSON",
-        "deepWikiMaxConcurrent": "Max concurrent queries"
+        "deepWikiMaxConcurrent": "Max concurrent queries",
+        "deepWikiReuseSessions": "Reuse fixed sessions (fewer server sessions, soft context clear)"
       },
       "network": {
         "title": "Network",

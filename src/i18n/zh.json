@@ -718,7 +718,8 @@
         "mcpNotConfigured": "至少一个已启用的服务需要 endpoint + toolName",
         "mcpJsonPlaceholder": "粘贴 MCP 服务配置的 JSON 数组",
         "mcpJsonError": "无效 JSON",
-        "deepWikiMaxConcurrent": "最大并发查询数"
+        "deepWikiMaxConcurrent": "最大并发查询数",
+        "deepWikiReuseSessions": "复用固定会话(减少服务端会话数,软清空上下文)"
       },
       "network": {
         "title": "网络",

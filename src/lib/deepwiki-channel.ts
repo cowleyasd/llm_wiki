@@ -35,12 +35,39 @@ async function patchRecord(
 // starvation: project A's workers don't consume project B's slots.
 const deepWikiRunning = new Map<string, number>()
 
+// Fixed session pools (reuseSessions=true only). Per-project: n fixed UUIDs
+// + a free-slot set. claim takes a free slot, worker finally returns it.
+// slot↔session is strictly bound (slot k always uses pool[k]), and the
+// free-slot set guarantees no two workers share a slot concurrently.
+const sessionPools = new Map<string, string[]>()
+const freeSlots = new Map<string, Set<number>>()
+// Pending rebuild when maxConcurrent changes: rebuild only once all slots are
+// idle (freeSlots.size === pool.length), so we never hand out a slot still
+// in use. Set to the desired new n when a size mismatch is detected.
+const pendingRebuild = new Map<string, number>()
+
+function getOrCreateSessionPool(pp: string, n: number): { pool: string[]; free: Set<number> } {
+  const desired = Math.max(1, Math.floor(n) || 3)
+  let pool = sessionPools.get(pp)
+  if (!pool) {
+    pool = Array.from({ length: desired }, () => crypto.randomUUID())
+    sessionPools.set(pp, pool)
+    freeSlots.set(pp, new Set(pool.map((_, i) => i)))
+    pendingRebuild.delete(pp)
+  } else if (pool.length !== desired) {
+    // Size changed but workers may be in flight — defer rebuild until idle.
+    pendingRebuild.set(pp, desired)
+  }
+  return { pool, free: freeSlots.get(pp) ?? new Set() }
+}
+
 interface SchedulerCtx {
   projectPath: string
   projectId: string
   llmConfig: LlmConfig
   deepWikiConfig: DeepWikiSourceConfig
   maxConcurrent: number
+  reuseSessions: boolean
 }
 
 /**
@@ -58,6 +85,16 @@ async function claimNextPromptReady(ctx: SchedulerCtx): Promise<DeepWikiQueryRec
     const pp = normalizePath(ctx.projectPath)
     const running = deepWikiRunning.get(pp) ?? 0
     if (running >= ctx.maxConcurrent) return null
+    // reuseSessions=true: take a free slot (strict slot↔session binding).
+    let slotIdx: number | undefined
+    let sessionId: string | undefined
+    if (ctx.reuseSessions) {
+      const { pool, free } = getOrCreateSessionPool(pp, ctx.maxConcurrent)
+      if (free.size === 0) return null // all slots in use
+      slotIdx = Math.min(...free)
+      free.delete(slotIdx)
+      sessionId = pool[slotIdx]
+    }
     const records = await loadDeepWikiRecords(ctx.projectPath)
     // Earliest prompt_ready (FIFO by createdAt).
     let targetIdx = -1
@@ -69,8 +106,18 @@ async function claimNextPromptReady(ctx: SchedulerCtx): Promise<DeepWikiQueryRec
         targetIdx = i
       }
     }
-    if (targetIdx < 0) return null
-    records[targetIdx] = { ...records[targetIdx], status: "searching", error: null }
+    if (targetIdx < 0) {
+      // No record to claim — return the slot we tentatively took.
+      if (ctx.reuseSessions && slotIdx !== undefined) freeSlots.get(pp)?.add(slotIdx)
+      return null
+    }
+    records[targetIdx] = {
+      ...records[targetIdx],
+      status: "searching",
+      error: null,
+      slotIdx,
+      sessionId,
+    }
     await writeRecordsRaw(ctx.projectPath, records)
     deepWikiRunning.set(pp, running + 1)
     useDeepWikiStore.getState().updateRecord(records[targetIdx].id, records[targetIdx])
@@ -78,14 +125,35 @@ async function claimNextPromptReady(ctx: SchedulerCtx): Promise<DeepWikiQueryRec
   })
 }
 
-/** Release one slot and pump the queue. Called from worker's finally. */
-function releaseSlotAndPump(ctx: SchedulerCtx): void {
+/** Release one slot (and return it to the free set when reuseSessions) and
+ *  pump the queue. Runs the release inside withRecordsLock so the
+ *  free.add + running-- pair is atomic with claims. Called from worker's
+ *  finally. */
+function releaseSlotAndPump(ctx: SchedulerCtx, record: DeepWikiQueryRecord): void {
   const pp = normalizePath(ctx.projectPath)
-  const cur = deepWikiRunning.get(pp) ?? 0
-  deepWikiRunning.set(pp, Math.max(0, cur - 1))
-  void processDeepWikiQueue(ctx).catch((err) =>
-    console.warn("[deepwiki-channel] pump failed:", err),
-  )
+  void withRecordsLock(ctx.projectPath, async () => {
+    const cur = deepWikiRunning.get(pp) ?? 0
+    deepWikiRunning.set(pp, Math.max(0, cur - 1))
+    if (ctx.reuseSessions && record.slotIdx !== undefined) {
+      freeSlots.get(pp)?.add(record.slotIdx)
+      // If a rebuild is pending and the pool is now fully idle, rebuild.
+      const desired = pendingRebuild.get(pp)
+      if (desired !== undefined) {
+        const pool = sessionPools.get(pp) ?? []
+        const free = freeSlots.get(pp) ?? new Set<number>()
+        if (free.size === pool.length) {
+          const newPool = Array.from({ length: desired }, () => crypto.randomUUID())
+          sessionPools.set(pp, newPool)
+          freeSlots.set(pp, new Set(newPool.map((_, i) => i)))
+          pendingRebuild.delete(pp)
+        }
+      }
+    }
+  }).then(() => {
+    void processDeepWikiQueue(ctx).catch((err) =>
+      console.warn("[deepwiki-channel] pump failed:", err),
+    )
+  })
 }
 
 /**
@@ -131,6 +199,10 @@ export async function runDeepWikiQueryRecord(
     const result = await invoke<DeepWikiSearchResult>("deepwiki_search", {
       prompt: record.prompt,
       config: ctx.deepWikiConfig,
+      // reuseSessions=true: pass the fixed slot session id (Rust uses it +
+      // prepends a soft "ignore history" prefix). reuseSessions=false: pass
+      // undefined → Rust generates a fresh UUID (legacy fire-and-forget).
+      sessionId: record.sessionId,
     })
     if (!result.content?.trim()) {
       throw new Error("DeepWiki returned an empty response")
@@ -157,9 +229,9 @@ export async function runDeepWikiQueryRecord(
     })
   } finally {
     // Release the slot regardless of outcome, then pump the queue so the next
-    // prompt_ready record starts. Slot release is just a decrement (no
-    // capacity race — only the claim path increments, under the lock).
-    releaseSlotAndPump(ctx)
+    // prompt_ready record starts. reuseSessions=true also returns the slot to
+    // the free set (atomic with the decrement, inside withRecordsLock).
+    releaseSlotAndPump(ctx, record)
   }
 }
 
@@ -274,6 +346,7 @@ function makeCtx(
     llmConfig,
     deepWikiConfig,
     maxConcurrent: normalizeMaxConcurrent(deepWikiConfig.maxConcurrent),
+    reuseSessions: deepWikiConfig.reuseSessions ?? false,
   }
 }
 
@@ -347,6 +420,12 @@ export interface DeepWikiQueryRecord {
   reviewItemId?: string
   /** Originating graph gap context, for traceability. */
   gapContext?: unknown
+  /** Concurrency slot index assigned at claim time (reuseSessions=true only).
+   *  Returned to the free-slot set in the worker's finally. */
+  slotIdx?: number
+  /** DeepWiki session id (reuseSessions=true: from the fixed pool[slotIdx];
+   *  reuseSessions=false: undefined → Rust generates a fresh UUID). */
+  sessionId?: string
 }
 
 let idCounter = 0
