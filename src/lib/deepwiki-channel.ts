@@ -371,6 +371,26 @@ export async function resumeDeepWikiQueries(
 ): Promise<void> {
   const records = await loadDeepWikiRecords(projectPath)
   useDeepWikiStore.getState().setRecords(records)
+  // Self-heal: `ingested` records whose onComplete callback was lost to a
+  // restart. If the ingest cache has an entry for this source file, ingest
+  // already completed → mark graphed. Otherwise leave as ingested (the
+  // ingest-queue may still be processing it after restart).
+  const { hasIngestCacheEntry } = await import("@/lib/ingest-cache")
+  for (const r of records) {
+    if (r.status === "ingested") {
+      const sourceFileName = `deepwiki-${r.id}.md`
+      const cached = await hasIngestCacheEntry(projectPath, sourceFileName)
+      if (cached) {
+        const updated = await mutateRecord(
+          projectPath,
+          r.id,
+          { status: "graphed", error: null },
+          { force: true },
+        )
+        if (updated) useDeepWikiStore.getState().updateRecord(r.id, updated)
+      }
+    }
+  }
   // Reset mid-flight (prompt_ready stays; searching → prompt_ready) so the
   // scheduler can claim them. searching→prompt_ready is non-terminal→non-
   // terminal, no force needed.

@@ -38,6 +38,22 @@ async function loadCache(projectPath: string): Promise<CacheData> {
   }
 }
 
+/**
+ * Lightweight check: does the ingest cache have an entry for this source
+ * file (i.e. has it been ingested at least once)? Used by DeepWiki channel
+ * resume self-heal to detect `ingested` records whose ingest actually
+ * completed but whose onComplete callback was lost to a restart. Does NOT
+ * verify content hash — only that an entry with filesWritten exists.
+ */
+export async function hasIngestCacheEntry(
+  projectPath: string,
+  sourceFileName: string,
+): Promise<boolean> {
+  const cache = await loadCache(projectPath)
+  const entry = cache.entries[sourceFileName]
+  return Boolean(entry && Array.isArray(entry.filesWritten) && entry.filesWritten.length > 0)
+}
+
 async function saveCache(projectPath: string, cache: CacheData): Promise<void> {
   try {
     await writeFile(cachePath(projectPath), JSON.stringify(cache, null, 2))
