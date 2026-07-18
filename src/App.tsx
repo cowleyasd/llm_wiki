@@ -245,7 +245,7 @@ function App() {
         )
         const result = await checkForUpdates({
           currentVersion: __APP_VERSION__,
-          repo: "nashsu/llm_wiki",
+          repo: "cowleyasd/llm_wiki",
         })
         if (cancelled) return
         useUpdateStore.getState().setResult(result, Date.now())

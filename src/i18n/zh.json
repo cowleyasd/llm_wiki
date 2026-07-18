@@ -719,7 +719,8 @@
         "mcpJsonPlaceholder": "粘贴 MCP 服务配置的 JSON 数组",
         "mcpJsonError": "无效 JSON",
         "deepWikiMaxConcurrent": "最大并发查询数",
-        "deepWikiReuseSessions": "复用固定会话(减少服务端会话数,软清空上下文)"
+        "deepWikiReuseSessions": "复用固定会话(减少服务端会话数,软清空上下文)",
+        "deepWikiRetryCooldown": "429后重试冷却时间(秒)"
       },
       "network": {
         "title": "网络",
@@ -923,7 +924,8 @@
         "openDownload": "打开下载页",
         "later": "稍后",
         "autoCheck": "应用启动时自动检查更新（每 6 小时最多一次）",
-        "appDescription": "一个由 LLM 驱动的个人知识库。源代码："
+        "appDescription": "一个由 LLM 驱动的个人知识库。源代码：",
+        "forkedFrom": "源仓库"
       },
       "mineru": {
         "title": "MinerU PDF 解析",
@@ -1113,7 +1115,8 @@
     "retry": "重试",
     "topic": "主题",
     "error": "错误",
-    "retryAll": "重试所有失败"
+    "retryAll": "重试所有失败",
+    "statusPendingAssembly": "等待组装提示词"
   },
   "time": {
     "justNow": "刚刚",

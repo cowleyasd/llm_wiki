@@ -42,7 +42,7 @@ export function IconSidebar({ onSwitchProject }: IconSidebarProps) {
   const researchActiveCount = useResearchStore((s) => s.tasks.filter((t) => t.status !== "done" && t.status !== "error").length)
   const toggleResearchPanel = useResearchStore((s) => s.setPanelOpen)
   const deepWikiPanelOpen = useDeepWikiStore((s) => s.panelOpen)
-  const deepWikiActiveCount = useDeepWikiStore((s) => s.records.filter((r) => r.status === "prompt_ready" || r.status === "searching").length)
+  const deepWikiActiveCount = useDeepWikiStore((s) => s.records.filter((r) => r.status === "pending_assembly" || r.status === "prompt_ready" || r.status === "searching").length)
   const toggleDeepWikiPanel = useDeepWikiStore((s) => s.setPanelOpen)
   // Use `hasAvailableUpdate` (ignores dismiss state) rather than
   // `shouldShowUpdateBanner`. The dot is a passive signpost — it

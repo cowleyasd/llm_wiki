@@ -55,7 +55,7 @@ export function AboutSection() {
     useUpdateStore.getState().setChecking(true)
     const result = await checkForUpdates({
       currentVersion: __APP_VERSION__,
-      repo: "nashsu/llm_wiki",
+      repo: "cowleyasd/llm_wiki",
     })
     const now = Date.now()
     useUpdateStore.getState().setResult(result, now)
@@ -105,6 +105,7 @@ export function AboutSection() {
   })()
   const rows: Array<{ label: string; value: string; mono?: boolean }> = [
     { label: t("settings.sections.about.version"), value: `v${__APP_VERSION__}`, mono: true },
+    { label: t("settings.sections.about.forkedFrom", "Forked from"), value: "nashsu/llm_wiki", mono: true },
     { label: t("settings.sections.about.clipServer"), value: `${clipStatus}  @  127.0.0.1:19827`, mono: true },
     { label: t("settings.sections.about.apiServer"), value: `${apiStatusDisplay}  @  127.0.0.1:${API_SERVER_PORT}`, mono: true },
   ]

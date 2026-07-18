@@ -127,6 +127,9 @@ export interface DeepWikiSourceConfig {
    *  answers independent despite the server being stateful. Default false
    *  (fire-and-forget, one new session per query — legacy behavior). */
   reuseSessions?: boolean
+  /** Cooldown (seconds) after a 429 (rate limit) before the DeepWiki channel
+   *  resumes querying. Default 60. */
+  retryCooldownSecs?: number
 }
 
 /**

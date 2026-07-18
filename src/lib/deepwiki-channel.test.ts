@@ -18,10 +18,12 @@ function ctxFor(overrides: Partial<DeepWikiSourceConfig> = {}, projectId = "proj
     deepWikiConfig: {
       enabled: true, baseUrl: "u", spaceId: "s", model: "m", token: "t",
       branch: "main", timeoutSecs: 60, maxSnippetChars: 10000,
+      assemblyInstruction: "",
       ...overrides,
     } as DeepWikiSourceConfig,
     maxConcurrent: overrides.maxConcurrent ?? 3,
     reuseSessions: overrides.reuseSessions ?? false,
+    retryCooldownSecs: overrides.retryCooldownSecs ?? 60,
   }
 }
 
@@ -35,9 +37,17 @@ vi.mock("@/commands/fs", () => ({
 }))
 vi.mock("@/lib/path-utils", () => ({ normalizePath: (p: string) => p.replace(/\/+$/, "") }))
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }))
-vi.mock("@/lib/deepwiki-assembly", () => ({
-  assembleDeepWikiPrompt: vi.fn().mockResolvedValue({ prompt: "assembled-prompt", fellBack: false }),
-}))
+// Mock assembly: stub assembleDeepWikiPrompt (LLM call) per-test, but expose
+// the REAL templateAssembly — deepwiki-channel imports it as a non-LLM fallback
+// and it must behave identically to production. vi.mock is hoisted above
+// imports, so we use vi.importActual to pull the real templateAssembly.
+vi.mock("@/lib/deepwiki-assembly", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/deepwiki-assembly")>()
+  return {
+    ...actual,
+    assembleDeepWikiPrompt: vi.fn().mockResolvedValue({ prompt: "assembled-prompt", fellBack: false }),
+  }
+})
 vi.mock("@/lib/ingest-queue", () => ({ enqueueIngest: vi.fn().mockResolvedValue("task-1") }))
 
 let tmpDir: string
@@ -55,9 +65,15 @@ beforeEach(async () => {
   // would wipe the fs mock impls above). Keeps "not.toHaveBeenCalled" honest.
   const { invoke } = await import("@tauri-apps/api/core")
   const { enqueueIngest } = await import("@/lib/ingest-queue")
+  const { assembleDeepWikiPrompt } = await import("@/lib/deepwiki-assembly")
   ;(invoke as any).mockReset()
   ;(enqueueIngest as any).mockReset()
   ;(enqueueIngest as any).mockResolvedValue("task-1")
+  // Assembly mock: reset call history but restore the default success impl so
+  // every test starts from a known state. Individual tests override with
+  // mockImplementation/mockResolvedValue/mockRejectedValue as needed.
+  ;(assembleDeepWikiPrompt as any).mockReset()
+  ;(assembleDeepWikiPrompt as any).mockResolvedValue({ prompt: "assembled-prompt", fellBack: false })
 })
 
 afterEach(async () => {
@@ -261,26 +277,163 @@ describe("resumeDeepWikiQueries", () => {
   })
 })
 
-describe("triggerDeepWikiQuery assembly timeout", () => {
-  it("abort on timeout, writes no record", async () => {
-    vi.useFakeTimers()
+describe("triggerDeepWikiQuery (async assembly)", () => {
+  it("writes a pending_assembly record (prompt empty) and returns id without calling assembly", async () => {
     const { assembleDeepWikiPrompt } = await import("@/lib/deepwiki-assembly")
-    ;(assembleDeepWikiPrompt as any).mockImplementation(
-      (_l: unknown, _c: unknown, _i: unknown, signal: AbortSignal) =>
-        new Promise((_res, rej) => {
-          signal?.addEventListener("abort", () =>
-            rej(Object.assign(new Error("aborted"), { name: "AbortError" })),
-          )
-        }),
+    // Block the worker's DeepWiki query so it doesn't settle inside this test
+    // (we only care that trigger returns fast and writes the record). The
+    // fire-and-forget worker is allowed to keep running; its invoke won't
+    // resolve because we never release it.
+    const { invoke } = await import("@tauri-apps/api/core")
+    ;(invoke as any).mockImplementation(
+      () => new Promise(() => {}), // never resolves
     )
-    const dwConfig: any = { timeoutSecs: 1, assemblyInstruction: "" }
-    const p = triggerDeepWikiQuery(
-      tmpDir!, { topic: "T", purpose: "", wikiIndex: "" } as any, {} as any, dwConfig, "proj-1",
+
+    const context = { topic: "T", purpose: "p", wikiIndex: "idx" } as any
+    const id = await triggerDeepWikiQuery(
+      tmpDir!, context, {} as any,
+      { enabled: true, timeoutSecs: 60, assemblyInstruction: "" } as any,
+      "proj-1", "rev-1",
     )
-    vi.advanceTimersByTime(1500)
-    await expect(p).rejects.toThrow(/abort/i)
-    expect(await loadDeepWikiRecords(tmpDir!)).toEqual([])
-    vi.useRealTimers()
+
+    // Returned id matches the persisted record.
+    expect(id).toMatch(/^dw-/)
+    const records = await loadDeepWikiRecords(tmpDir!)
+    expect(records).toHaveLength(1)
+    expect(records[0].id).toBe(id)
+    // New flow: trigger writes pending_assembly with an EMPTY prompt. Assembly
+    // is deferred to the worker.
+    expect(records[0].status).toBe("pending_assembly")
+    expect(records[0].prompt).toBe("")
+    expect(records[0].researchContext).toEqual(context)
+    expect(records[0].reviewItemId).toBe("rev-1")
+    // Assembly must NOT be called synchronously by trigger.
+    expect(assembleDeepWikiPrompt).not.toHaveBeenCalled()
+  })
+})
+
+describe("runDeepWikiQueryRecord — assembly stage (pending_assembly → prompt)", () => {
+  it("assembles when prompt is empty + researchContext present, then queries DeepWiki", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    const { assembleDeepWikiPrompt } = await import("@/lib/deepwiki-assembly")
+    ;(invoke as any).mockResolvedValue({ content: "DeepWiki answer", spaceUrl: "http://dw" })
+    ;(assembleDeepWikiPrompt as any).mockResolvedValue({ prompt: "assembled-by-llm", fellBack: false })
+
+    // pending_assembly record: empty prompt + researchContext → worker assembles.
+    const record = createDeepWikiRecord({
+      topic: "T",
+      prompt: "",
+      researchContext: { topic: "T", purpose: "p", wikiIndex: "idx" } as any,
+      status: "pending_assembly",
+    })
+    await appendRecord(tmpDir!, record)
+
+    await runDeepWikiQueryRecord(ctxFor(), record)
+
+    // Assembly was called with the stored researchContext.
+    expect(assembleDeepWikiPrompt).toHaveBeenCalledTimes(1)
+    const callArgs = (assembleDeepWikiPrompt as any).mock.calls[0]
+    expect(callArgs[1]).toEqual(record.researchContext)
+    // Prompt was persisted.
+    const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(persisted.prompt).toBe("assembled-by-llm")
+    // DeepWiki query was invoked with the assembled prompt.
+    expect((invoke as any).mock.calls[0][1]).toMatchObject({ prompt: "assembled-by-llm" })
+    // Record reached ingested.
+    expect(persisted.status).toBe("ingested")
+  })
+
+  it("assembly timeout (AbortError) falls back to template, does NOT pause channel", async () => {
+    vi.useFakeTimers()
+    try {
+      const { invoke } = await import("@tauri-apps/api/core")
+      const { assembleDeepWikiPrompt } = await import("@/lib/deepwiki-assembly")
+      ;(assembleDeepWikiPrompt as any).mockImplementation(
+        (_l: unknown, _c: unknown, _i: unknown, signal: AbortSignal) =>
+          new Promise((_res, rej) => {
+            signal?.addEventListener("abort", () =>
+              rej(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            )
+          }),
+      )
+      ;(invoke as any).mockResolvedValue({ content: "answer after fallback", spaceUrl: "" })
+
+      // timeoutSecs=1 → worker's AbortController fires after 1000ms (fake).
+      const record = createDeepWikiRecord({
+        topic: "T",
+        prompt: "",
+        researchContext: { topic: "T", purpose: "p", wikiIndex: "idx" } as any,
+        status: "pending_assembly",
+      })
+      await appendRecord(tmpDir!, record)
+
+      // Drive the worker to completion under fake timers. The worker sets a
+      // 1000ms abort timer then awaits assembleDeepWikiPrompt (which rejects
+      // on abort). advanceTimersByTimeAsync fires the timer AND flushes the
+      // microtask chain that follows (AbortError → template fallback → invoke
+      // → patchRecord), so by the time it resolves the worker has progressed.
+      const workerP = runDeepWikiQueryRecord(ctxFor({ timeoutSecs: 1 }), record)
+      await vi.advanceTimersByTimeAsync(1500)
+      await workerP
+
+      const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+      // Template fallback produced a non-empty prompt and the query succeeded.
+      expect(persisted.prompt).toContain("[上下文]")
+      expect(persisted.status).toBe("ingested")
+      // Channel was NOT paused: DeepWiki query still ran (invoke called).
+      expect(invoke).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe("runDeepWikiQueryRecord — 429 pauses the channel", () => {
+  it("assembly 429 → record back to pending_assembly, channel paused (no claim until cooldown)", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    const { assembleDeepWikiPrompt } = await import("@/lib/deepwiki-assembly")
+    // Assembly throws a 429 → worker must pause + revert record.
+    ;(assembleDeepWikiPrompt as any).mockRejectedValue(new Error("429 rate limit exceeded"))
+    // If the pause guard fails, invoke would be called — make it noisy.
+    ;(invoke as any).mockResolvedValue({ content: "should-not-reach", spaceUrl: "" })
+
+    const record = createDeepWikiRecord({
+      topic: "T",
+      prompt: "",
+      researchContext: { topic: "T", purpose: "p", wikiIndex: "idx" } as any,
+      status: "pending_assembly",
+    })
+    await appendRecord(tmpDir!, record)
+
+    const ctx = ctxFor({ retryCooldownSecs: 1 })
+    await runDeepWikiQueryRecord(ctx, record)
+
+    // DeepWiki query never ran (assembly 429 short-circuited the worker).
+    expect(invoke).not.toHaveBeenCalled()
+    // Record reverted to pending_assembly, prompt still empty.
+    const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(persisted.status).toBe("pending_assembly")
+    expect(persisted.prompt).toBe("")
+
+    // Channel is paused: processDeepWikiQueue claims nothing even though a
+    // pending_assembly record exists. invoke must remain uncalled.
+    await processDeepWikiQueue(ctx)
+    await new Promise((r) => setTimeout(r, 10))
+    expect(invoke).not.toHaveBeenCalled()
+    // Still pending_assembly (not claimed → not flipped to searching).
+    const afterPump = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(afterPump.status).toBe("pending_assembly")
+
+    // After the cooldown elapses, a fresh pump can claim + assemble + query.
+    // Restore assembly to success and advance past the 1s cooldown.
+    ;(assembleDeepWikiPrompt as any).mockResolvedValue({ prompt: "ok", fellBack: false })
+    await new Promise((r) => setTimeout(r, 1100))
+    await processDeepWikiQueue(ctx)
+    await new Promise((r) => setTimeout(r, 20))
+
+    const final = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
+    expect(final.status).toBe("ingested")
+    expect(invoke).toHaveBeenCalledTimes(1)
   })
 })
 
