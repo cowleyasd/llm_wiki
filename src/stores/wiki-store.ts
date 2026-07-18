@@ -116,6 +116,17 @@ export interface DeepWikiSourceConfig {
   assemblyInstruction?: string
   timeoutSecs?: number
   maxSnippetChars?: number
+  /** Max concurrent DeepWiki queries for this space (default 3). DeepWiki
+   *  service cannot handle unbounded concurrency; this caps how many
+   *  runDeepWikiQueryRecord workers run at once per project. */
+  maxConcurrent?: number
+  /** When true, reuse a fixed pool of `maxConcurrent` session ids (rotated
+   *  per concurrency slot) instead of generating a fresh UUID per query.
+   *  Reduces the number of sessions created on the DeepWiki server. A soft
+   *  "ignore prior history" prefix is added to each query prompt to keep
+   *  answers independent despite the server being stateful. Default false
+   *  (fire-and-forget, one new session per query — legacy behavior). */
+  reuseSessions?: boolean
 }
 
 /**

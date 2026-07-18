@@ -17,6 +17,8 @@ export function normalizeDeepWikiConfig(config?: DeepWikiSourceConfig): Required
     assemblyInstruction: config?.assemblyInstruction ?? "",
     timeoutSecs: clampPositive(config?.timeoutSecs, 0),
     maxSnippetChars: clampPositive(config?.maxSnippetChars, 0),
+    maxConcurrent: clampPositive(config?.maxConcurrent, 3),
+    reuseSessions: config?.reuseSessions ?? false,
   }
 }
 

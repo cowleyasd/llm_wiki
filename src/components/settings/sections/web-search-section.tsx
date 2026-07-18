@@ -712,6 +712,25 @@ function DeepWikiConfigCard({
                 onChange={(e) => onSave({ maxSnippetChars: Number(e.target.value) || 4000 })}
               />
             </div>
+            <div className="space-y-1">
+              <Label className="text-xs">{t("settings.sections.webSearch.deepWikiMaxConcurrent", "Max concurrent queries")}</Label>
+              <Input
+                type="number"
+                value={cfg.maxConcurrent ?? 3}
+                onChange={(e) => onSave({ maxConcurrent: Number(e.target.value) || 3 })}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="dw-reuse-sessions"
+                checked={cfg.reuseSessions ?? false}
+                onChange={(e) => onSave({ reuseSessions: e.target.checked })}
+              />
+              <Label htmlFor="dw-reuse-sessions" className="text-xs">
+                {t("settings.sections.webSearch.deepWikiReuseSessions", "Reuse fixed sessions (fewer server sessions, soft context clear)")}
+              </Label>
+            </div>
           </div>
           <div className="space-y-1">
             <Label className="text-xs">

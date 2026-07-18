@@ -32,15 +32,29 @@ pub struct DeepWikiConfig {
     pub branch: String,
     pub timeout_secs: u64,
     pub max_snippet_chars: usize,
+    /// Max concurrent DeepWiki queries (informational on the Rust side; the TS
+    /// scheduler enforces it). Kept for config round-trip consistency.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    /// When true, the TS side passes a fixed session_id (rotated per slot);
+    /// Rust uses it as-is and prepends a soft "ignore history" prompt prefix.
+    /// Default false — Rust generates a fresh UUID per query (legacy).
+    #[serde(default)]
+    pub reuse_sessions: bool,
+}
+
+fn default_max_concurrent() -> usize {
+    3
 }
 
 #[tauri::command]
 pub async fn deepwiki_search(
     prompt: String,
     config: DeepWikiConfig,
+    session_id: Option<String>,
 ) -> Result<DeepWikiSearchResult, String> {
     run_guarded_async("deepwiki_search", async move {
-        run_deepwiki_search(&prompt, &config).await
+        run_deepwiki_search(&prompt, &config, session_id).await
     })
     .await
 }
@@ -48,6 +62,7 @@ pub async fn deepwiki_search(
 async fn run_deepwiki_search(
     prompt: &str,
     config: &DeepWikiConfig,
+    session_id: Option<String>,
 ) -> Result<DeepWikiSearchResult, String> {
     if prompt.trim().is_empty() {
         return Err("DeepWiki prompt is empty".to_string());
@@ -69,7 +84,20 @@ async fn run_deepwiki_search(
     }
 
     let token = resolve_token(config).await?;
-    let session_id = Uuid::new_v4().to_string();
+    // reuseSessions=true: TS passes a fixed slot session id → use it as-is
+    // and prepend a soft "ignore prior history" prefix so the stateful server
+    // doesn't bleed one query's context into the next despite session reuse.
+    // reuseSessions=false (None/undefined): fresh UUID per query (legacy).
+    let (session_id, request_content) = match session_id {
+        Some(id) if !id.trim().is_empty() => {
+            let content = format!(
+                "（本次为独立查询，请忽略此 session 中之前的任何对话历史，仅根据下方问题独立回答。）\n\n{}",
+                prompt
+            );
+            (id, content)
+        }
+        _ => (Uuid::new_v4().to_string(), prompt.to_string()),
+    };
     let space_url = build_space_url(&config.base_url, &config.space_id);
     let endpoint = format!(
         "{}/v1/chat/completions",
@@ -96,7 +124,7 @@ async fn run_deepwiki_search(
             .header("X-User-Token", &token)
             .header("Content-Type", "application/json")
             .json(&json!({
-                "content": prompt,
+                "content": request_content,
                 "branch": config.branch,
                 "model": config.model,
                 "space_id": config.space_id,
