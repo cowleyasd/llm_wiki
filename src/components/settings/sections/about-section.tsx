@@ -135,6 +135,31 @@ export function AboutSection() {
         <p className="mt-1 text-sm text-muted-foreground">
           {t("settings.sections.about.description")}
         </p>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {t("settings.sections.about.sourceCode", "Source code")}:{" "}
+          <a
+            className="cursor-pointer underline underline-offset-2 hover:text-primary"
+            href="https://github.com/cowleyasd/llm_wiki"
+            onClick={(e) => {
+              e.preventDefault()
+              void openUrl("https://github.com/cowleyasd/llm_wiki").catch(() => {})
+            }}
+          >
+            github.com/cowleyasd/llm_wiki
+          </a>
+          {" "}
+          {t("settings.sections.about.forkedFromPrefix", "forked from")}:{" "}
+          <a
+            className="cursor-pointer underline underline-offset-2 hover:text-primary"
+            href="https://github.com/nashsu/llm_wiki"
+            onClick={(e) => {
+              e.preventDefault()
+              void openUrl("https://github.com/nashsu/llm_wiki").catch(() => {})
+            }}
+          >
+            github.com/nashsu/llm_wiki
+          </a>
+        </p>
       </div>
 
       <div className="rounded-md border divide-y">

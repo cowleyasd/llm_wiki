@@ -925,7 +925,9 @@
         "later": "Later",
         "autoCheck": "Check for updates automatically on startup (at most once every 6 hours)",
         "appDescription": "An LLM-driven personal knowledge base. Source:",
-        "forkedFrom": "Forked from"
+        "forkedFrom": "Forked from",
+        "sourceCode": "Source code",
+        "forkedFromPrefix": "forked from"
       },
       "mineru": {
         "title": "MinerU PDF Parser",
