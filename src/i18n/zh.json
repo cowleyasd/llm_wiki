@@ -924,7 +924,8 @@
         "openDownload": "打开下载页",
         "later": "稍后",
         "autoCheck": "应用启动时自动检查更新（每 6 小时最多一次）",
-        "appDescription": "一个由 LLM 驱动的个人知识库。源代码："
+        "appDescription": "一个由 LLM 驱动的个人知识库。源代码：",
+        "forkedFrom": "源仓库"
       },
       "mineru": {
         "title": "MinerU PDF 解析",

@@ -924,7 +924,8 @@
         "openDownload": "Open download page",
         "later": "Later",
         "autoCheck": "Check for updates automatically on startup (at most once every 6 hours)",
-        "appDescription": "An LLM-driven personal knowledge base. Source:"
+        "appDescription": "An LLM-driven personal knowledge base. Source:",
+        "forkedFrom": "Forked from"
       },
       "mineru": {
         "title": "MinerU PDF Parser",
