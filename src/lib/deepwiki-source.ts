@@ -20,7 +20,7 @@ export function normalizeDeepWikiConfig(config?: DeepWikiSourceConfig): Required
     maxConcurrent: clampPositive(config?.maxConcurrent, 3),
     reuseSessions: config?.reuseSessions ?? false,
     retryCooldownSecs: clampPositive(config?.retryCooldownSecs, 60),
-    forceReplaceBody: config?.forceReplaceBody ?? false,
+    newVersionWinsOnConflict: config?.newVersionWinsOnConflict ?? false,
   }
 }
 

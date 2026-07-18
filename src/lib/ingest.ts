@@ -1926,15 +1926,15 @@ async function writeFileBlocks(
         const replaceExistingBody = Boolean(
           existing && isOwnedOnlyBySource(existing, sourceFileName),
         )
-        // When forceReplaceBody is enabled, still go through LLM merge (to
+        // When newVersionWinsOnConflict is enabled, still go through LLM merge (to
         // preserve non-conflicting content) but use a conflict-resolution
         // prompt that gives the new version precedence.
         const isDeepWikiSource = sourceFileName.startsWith("deepwiki-")
-        const forceReplaceBody = isDeepWikiSource && useWikiStore.getState().searchApiConfig?.deepWiki?.forceReplaceBody === true
+        const newVersionWinsOnConflict = isDeepWikiSource && useWikiStore.getState().searchApiConfig?.deepWiki?.newVersionWinsOnConflict === true
         const merged = await mergePageContent(
           content,
           existing || null,
-          buildPageMerger(llmConfig, forceReplaceBody),
+          buildPageMerger(llmConfig, newVersionWinsOnConflict),
           {
             sourceFileName,
             pagePath: relativePath,
@@ -2858,9 +2858,9 @@ async function analyzeLongSourceInChunks(
  * Page-merge.ts handles all the sanity-checking and fallback paths;
  * this is just the "stream the LLM" wrapper.
  */
-function buildPageMerger(llmConfig: LlmConfig, forceReplaceBody?: boolean): MergeFn {
+function buildPageMerger(llmConfig: LlmConfig, newVersionWinsOnConflict?: boolean): MergeFn {
   return async (existingContent, incomingContent, sourceFileName, signal) => {
-    const systemPrompt = buildPageMergeSystemPrompt(forceReplaceBody)
+    const systemPrompt = buildPageMergeSystemPrompt(newVersionWinsOnConflict)
 
     const userMessage = [
       `## Existing version on disk`,
@@ -2911,7 +2911,7 @@ function buildPageMerger(llmConfig: LlmConfig, forceReplaceBody?: boolean): Merg
   }
 }
 
-export function buildPageMergeSystemPrompt(forceReplaceBody?: boolean): string {
+export function buildPageMergeSystemPrompt(newVersionWinsOnConflict?: boolean): string {
   return [
     "You are merging two versions of the same wiki page into one coherent document.",
     "Both versions target the same wiki page; one is already on disk,",
@@ -2922,7 +2922,7 @@ export function buildPageMergeSystemPrompt(forceReplaceBody?: boolean): string {
     "- Preserves every factual claim from both versions (do not drop content)",
     "- Eliminates redundancy when both versions state the same fact",
     "- Preserves subject/source boundaries: if either version mentions other entities/models/products/methods for comparison, keep those comparisons attribution-exact and do not fold them into claims about the main page subject",
-    forceReplaceBody
+    newVersionWinsOnConflict
       ? "- When claims conflict, the NEWLY GENERATED version takes precedence (it comes from a high-confidence source). Resolve the conflict in favor of the new version and drop the contradicted claim from the old version. Do NOT keep both sides."
       : "- When claims conflict or apply to different subjects, keep them separated and say which source version supports each one instead of synthesizing a single generalized conclusion",
     "- When in doubt whether two similar-looking claims describe the same fact, prefer keeping them separate",

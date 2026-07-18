@@ -743,8 +743,8 @@ function DeepWikiConfigCard({
               <input
                 type="checkbox"
                 id="dw-force-replace"
-                checked={cfg.forceReplaceBody ?? false}
-                onChange={(e) => onSave({ forceReplaceBody: e.target.checked })}
+                checked={cfg.newVersionWinsOnConflict ?? false}
+                onChange={(e) => onSave({ newVersionWinsOnConflict: e.target.checked })}
               />
               <Label htmlFor="dw-force-replace" className="text-xs">
                 {t("settings.sections.webSearch.deepWikiForceReplaceBody", "Force replace body on re-ingest (DeepWiki overrides conflicts)")}
