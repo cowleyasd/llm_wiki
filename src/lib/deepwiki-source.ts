@@ -19,6 +19,7 @@ export function normalizeDeepWikiConfig(config?: DeepWikiSourceConfig): Required
     maxSnippetChars: clampPositive(config?.maxSnippetChars, 0),
     maxConcurrent: clampPositive(config?.maxConcurrent, 3),
     reuseSessions: config?.reuseSessions ?? false,
+    retryCooldownSecs: clampPositive(config?.retryCooldownSecs, 60),
   }
 }
 

@@ -117,6 +117,13 @@ function StatusBadge({ status }: { status: string }) {
         {t("deepwiki.statusSearching")}
       </span>
     )
+  if (status === "pending_assembly")
+    return (
+      <span className="flex shrink-0 items-center gap-1 text-amber-500">
+        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        {t("deepwiki.statusPendingAssembly", "Pending assembly")}
+      </span>
+    )
   if (status === "prompt_ready")
     return (
       <span className="flex shrink-0 items-center gap-1 text-muted-foreground">

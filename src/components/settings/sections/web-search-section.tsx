@@ -731,6 +731,14 @@ function DeepWikiConfigCard({
                 {t("settings.sections.webSearch.deepWikiReuseSessions", "Reuse fixed sessions (fewer server sessions, soft context clear)")}
               </Label>
             </div>
+            <div className="space-y-1">
+              <Label className="text-xs">{t("settings.sections.webSearch.deepWikiRetryCooldown", "Retry cooldown (seconds after 429)")}</Label>
+              <Input
+                type="number"
+                value={cfg.retryCooldownSecs ?? 60}
+                onChange={(e) => onSave({ retryCooldownSecs: Number(e.target.value) || 60 })}
+              />
+            </div>
           </div>
           <div className="space-y-1">
             <Label className="text-xs">

@@ -1,7 +1,7 @@
 import { writeFileAtomic, readFile, createDirectory } from "@/commands/fs"
 import { normalizePath } from "@/lib/path-utils"
 import { invoke } from "@tauri-apps/api/core"
-import { assembleDeepWikiPrompt, type ResearchContext } from "@/lib/deepwiki-assembly"
+import { assembleDeepWikiPrompt, templateAssembly, type ResearchContext } from "@/lib/deepwiki-assembly"
 import { enqueueIngest } from "@/lib/ingest-queue"
 import { useDeepWikiStore } from "@/stores/deepwiki-store"
 import type { LlmConfig, DeepWikiSourceConfig } from "@/stores/wiki-store"
@@ -46,6 +46,25 @@ const freeSlots = new Map<string, Set<number>>()
 // in use. Set to the desired new n when a size mismatch is detected.
 const pendingRebuild = new Map<string, number>()
 
+// 429 rate-limit cooldown: when assembly or DeepWiki query hits a 429, the
+// entire channel pauses for retryCooldownSecs (configurable, default 60s).
+// Both assembly (百炼 LLM) and DeepWiki query may share the same LLM
+// provider, so a 429 anywhere means the quota is exhausted — stop everything.
+const channelPausedUntil = new Map<string, number>()
+
+async function pauseChannel(ctx: SchedulerCtx, cooldownMs: number): Promise<void> {
+  const pp = normalizePath(ctx.projectPath)
+  await withRecordsLock(ctx.projectPath, async () => {
+    channelPausedUntil.set(pp, Date.now() + cooldownMs)
+  })
+  setTimeout(() => void processDeepWikiQueue(ctx).catch(() => {}), cooldownMs)
+}
+
+function is429(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err)
+  return msg.includes("429") || msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("quota")
+}
+
 function getOrCreateSessionPool(pp: string, n: number): { pool: string[]; free: Set<number> } {
   const desired = Math.max(1, Math.floor(n) || 3)
   let pool = sessionPools.get(pp)
@@ -68,6 +87,7 @@ interface SchedulerCtx {
   deepWikiConfig: DeepWikiSourceConfig
   maxConcurrent: number
   reuseSessions: boolean
+  retryCooldownSecs: number
 }
 
 /**
@@ -83,6 +103,10 @@ interface SchedulerCtx {
 async function claimNextPromptReady(ctx: SchedulerCtx): Promise<DeepWikiQueryRecord | null> {
   return withRecordsLock(ctx.projectPath, async () => {
     const pp = normalizePath(ctx.projectPath)
+    // Pause check inside the lock — atomic with claim, so concurrent pumps
+    // can't claim after a 429 sets the cooldown.
+    const pausedUntil = channelPausedUntil.get(pp) ?? 0
+    if (Date.now() < pausedUntil) return null
     const running = deepWikiRunning.get(pp) ?? 0
     if (running >= ctx.maxConcurrent) return null
     // reuseSessions=true: take a free slot (strict slot↔session binding).
@@ -96,12 +120,12 @@ async function claimNextPromptReady(ctx: SchedulerCtx): Promise<DeepWikiQueryRec
       sessionId = pool[slotIdx]
     }
     const records = await loadDeepWikiRecords(ctx.projectPath)
-    // Earliest prompt_ready (FIFO by createdAt).
+    // Claim earliest pending_assembly or prompt_ready (FIFO by createdAt).
     let targetIdx = -1
     let targetCreatedAt = Infinity
     for (let i = 0; i < records.length; i++) {
       const r = records[i]
-      if (r.status === "prompt_ready" && r.createdAt < targetCreatedAt) {
+      if ((r.status === "pending_assembly" || r.status === "prompt_ready") && r.createdAt < targetCreatedAt) {
         targetCreatedAt = r.createdAt
         targetIdx = i
       }
@@ -192,45 +216,76 @@ export async function runDeepWikiQueryRecord(
   record: DeepWikiQueryRecord,
 ): Promise<void> {
   // Status was already flipped to "searching" by claimNextPromptReady (the
-  // scheduler holds the slot from that point). Worker does NOT re-patch
-  // searching. The slot is released in finally below — covers success, empty
-  // response, search throw, and write/enqueue errors.
+  // scheduler holds the slot from that point). The slot is released in finally.
   try {
-    const result = await invoke<DeepWikiSearchResult>("deepwiki_search", {
-      prompt: record.prompt,
-      config: ctx.deepWikiConfig,
-      // reuseSessions=true: pass the fixed slot session id (Rust uses it +
-      // prepends a soft "ignore history" prefix). reuseSessions=false: pass
-      // undefined → Rust generates a fresh UUID (legacy fire-and-forget).
-      sessionId: record.sessionId,
-    })
-    if (!result.content?.trim()) {
-      throw new Error("DeepWiki returned an empty response")
+    // ── Assembly stage (if prompt is empty = pending_assembly was claimed) ──
+    if (!record.prompt && record.researchContext) {
+      try {
+        const timeoutMs = (ctx.deepWikiConfig.timeoutSecs ?? 120) * 1000
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), timeoutMs)
+        try {
+          const result = await assembleDeepWikiPrompt(
+            ctx.llmConfig, record.researchContext!,
+            ctx.deepWikiConfig.assemblyInstruction ?? "", controller.signal,
+          )
+          record.prompt = result.prompt
+          await patchRecord(ctx.projectPath, record.id, { prompt: result.prompt })
+        } finally {
+          clearTimeout(timer)
+        }
+      } catch (err) {
+        if (is429(err)) {
+          // 429 = quota exhausted. Pause the entire channel (assembly + DeepWiki
+          // query share the same LLM provider). Record goes back to
+          // pending_assembly (prompt still empty → will re-assemble on retry).
+          await pauseChannel(ctx, ctx.retryCooldownSecs * 1000)
+          await patchRecord(ctx.projectPath, record.id, { status: "pending_assembly" })
+          return // slot released in finally
+        }
+        // Non-429 (timeout/network): template fallback is safe — not a quota issue.
+        const prompt = templateAssembly(record.researchContext!)
+        record.prompt = prompt
+        await patchRecord(ctx.projectPath, record.id, { prompt })
+      }
     }
-    const srcPath = sourceFilePath(ctx.projectPath, record.id)
-    await writeFileAtomic(srcPath, result.content)
-    // 1. Durably persist `ingested` first so the terminal guard has
-    //    something non-terminal to upgrade from.
-    await patchRecord(ctx.projectPath, record.id, { status: "ingested" })
-    // 2. Enqueue with a completion callback. The callback may fire
-    //    synchronously (early-exit failures) or much later (after
-    //    autoIngest finishes). The terminal guard ensures `graphed` /
-    //    `failed` written here cannot be regressed by a stray `ingested`.
-    await enqueueIngest(ctx.projectId, srcPath, "", (success, _writtenFiles, error) => {
-      void patchRecord(ctx.projectPath, record.id, {
-        status: success ? "graphed" : "failed",
-        error: success ? null : (error ?? "ingest failed"),
+
+    // ── DeepWiki query stage ──
+    try {
+      const result = await invoke<DeepWikiSearchResult>("deepwiki_search", {
+        prompt: record.prompt,
+        config: ctx.deepWikiConfig,
+        sessionId: record.sessionId,
       })
-    })
+      if (!result.content?.trim()) {
+        throw new Error("DeepWiki returned an empty response")
+      }
+      const srcPath = sourceFilePath(ctx.projectPath, record.id)
+      await writeFileAtomic(srcPath, result.content)
+      await patchRecord(ctx.projectPath, record.id, { status: "ingested" })
+      await enqueueIngest(ctx.projectId, srcPath, "", (success, _writtenFiles, error) => {
+        void patchRecord(ctx.projectPath, record.id, {
+          status: success ? "graphed" : "failed",
+          error: success ? null : (error ?? "ingest failed"),
+        })
+      })
+    } catch (err) {
+      if (is429(err)) {
+        // DeepWiki query 429 → same quota issue. Clear prompt so worker
+        // re-assembles on retry (don't reuse a stale prompt after cooldown).
+        await pauseChannel(ctx, ctx.retryCooldownSecs * 1000)
+        record.prompt = ""
+        await patchRecord(ctx.projectPath, record.id, { status: "pending_assembly", prompt: "" })
+        return // slot released in finally
+      }
+      throw err // other errors → failed (caught by outer catch)
+    }
   } catch (err) {
     await patchRecord(ctx.projectPath, record.id, {
       status: "failed",
       error: err instanceof Error ? err.message : String(err),
     })
   } finally {
-    // Release the slot regardless of outcome, then pump the queue so the next
-    // prompt_ready record starts. reuseSessions=true also returns the slot to
-    // the free set (atomic with the decrement, inside withRecordsLock).
     releaseSlotAndPump(ctx, record)
   }
 }
@@ -250,34 +305,20 @@ export async function triggerDeepWikiQuery(
   projectId: string,
   reviewItemId?: string,
 ): Promise<string> {
-  // Assembly timeout: AbortSignal threaded through assembleDeepWikiPrompt →
-  // streamChat so a stuck LLM request is truly cancelled (not raced). On
-  // timeout AbortError propagates out of assembleDeepWikiPrompt (hard failure,
-  // no template fallback) and no record is written. See Task 4.
-  const timeoutMs = (deepWikiConfig.timeoutSecs ?? 120) * 1000
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  let prompt: string
-  try {
-    const result = await assembleDeepWikiPrompt(
-      llmConfig, context, deepWikiConfig.assemblyInstruction ?? "", controller.signal,
-    )
-    prompt = result.prompt
-  } finally {
-    clearTimeout(timer)
-  }
+  // Write a pending_assembly record (prompt empty — assembly happens in the
+  // worker under slot-limited concurrency, not here synchronously). DR
+  // completes as soon as the record is durably persisted.
   const record = createDeepWikiRecord({
     topic: context.topic,
-    prompt,
+    prompt: "",
     reviewItemId,
     gapContext: context.gapContext,
+    researchContext: context,
+    status: "pending_assembly",
   })
-  // Append record (prompt_ready) atomically — DR completes on durable record.
   await appendRecord(projectPath, record)
   useDeepWikiStore.getState().addRecord(record)
 
-  // Pump the scheduler — it claims prompt_ready records up to maxConcurrent
-  // and starts workers. The record just appended is eligible immediately.
   const ctx = makeCtx(projectPath, projectId, llmConfig, deepWikiConfig)
   void processDeepWikiQueue(ctx).catch((err) =>
     console.warn("[deepwiki-channel] schedule failed:", err),
@@ -347,6 +388,7 @@ function makeCtx(
     deepWikiConfig,
     maxConcurrent: normalizeMaxConcurrent(deepWikiConfig.maxConcurrent),
     reuseSessions: deepWikiConfig.reuseSessions ?? false,
+    retryCooldownSecs: deepWikiConfig.retryCooldownSecs ?? 60,
   }
 }
 
@@ -391,15 +433,16 @@ export async function resumeDeepWikiQueries(
       }
     }
   }
-  // Reset mid-flight (prompt_ready stays; searching → prompt_ready) so the
-  // scheduler can claim them. searching→prompt_ready is non-terminal→non-
-  // terminal, no force needed.
+  // Reset mid-flight: searching → pending_assembly (prompt may be empty if
+  // assembly was interrupted; pending_assembly lets the worker re-assemble).
+  // pending_assembly records stay as-is (already eligible for claim).
   for (const r of records) {
     if (r.status === "searching") {
+      const resetStatus = r.prompt ? "prompt_ready" as const : "pending_assembly" as const
       const updated = await mutateRecord(
         projectPath,
         r.id,
-        { status: "prompt_ready", error: null },
+        { status: resetStatus, error: null },
       )
       if (updated) useDeepWikiStore.getState().updateRecord(r.id, updated)
     }
@@ -411,6 +454,7 @@ export async function resumeDeepWikiQueries(
 }
 
 export type DeepWikiQueryStatus =
+  | "pending_assembly"
   | "prompt_ready"
   | "searching"
   | "ingested"
@@ -446,6 +490,9 @@ export interface DeepWikiQueryRecord {
   /** DeepWiki session id (reuseSessions=true: from the fixed pool[slotIdx];
    *  reuseSessions=false: undefined → Rust generates a fresh UUID). */
   sessionId?: string
+  /** Assembly input (researchContext) — stored when status is pending_assembly
+   *  so the worker can assemble the prompt. Persisted for restart recovery. */
+  researchContext?: ResearchContext
 }
 
 let idCounter = 0
@@ -455,17 +502,20 @@ export function createDeepWikiRecord(input: {
   prompt: string
   reviewItemId?: string
   gapContext?: unknown
+  researchContext?: ResearchContext
+  status?: DeepWikiQueryStatus
 }): DeepWikiQueryRecord {
   const id = `dw-${Date.now()}-${++idCounter}`
   return {
     id,
     topic: input.topic,
     prompt: input.prompt,
-    status: "prompt_ready",
+    status: input.status ?? "prompt_ready",
     error: null,
     createdAt: Date.now(),
     reviewItemId: input.reviewItemId,
     gapContext: input.gapContext,
+    researchContext: input.researchContext,
   }
 }
 

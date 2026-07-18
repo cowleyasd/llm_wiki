@@ -719,7 +719,8 @@
         "mcpJsonPlaceholder": "Paste a JSON array of MCP service configs",
         "mcpJsonError": "Invalid JSON",
         "deepWikiMaxConcurrent": "Max concurrent queries",
-        "deepWikiReuseSessions": "Reuse fixed sessions (fewer server sessions, soft context clear)"
+        "deepWikiReuseSessions": "Reuse fixed sessions (fewer server sessions, soft context clear)",
+        "deepWikiRetryCooldown": "Retry cooldown (seconds after 429)"
       },
       "network": {
         "title": "Network",
@@ -1113,7 +1114,8 @@
     "retry": "Retry",
     "topic": "Topic",
     "error": "Error",
-    "retryAll": "Retry all failed"
+    "retryAll": "Retry all failed",
+    "statusPendingAssembly": "Pending assembly"
   },
   "time": {
     "justNow": "just now",

@@ -196,6 +196,13 @@ export async function assembleDeepWikiPrompt(
   }
 
   if (streamError) {
+    // 429 / rate limit: rethrow so the worker can pause the channel.
+    // Do NOT template-fallback on 429 — it's a quota issue, not a quality issue.
+    const msg = streamError.message || ""
+    if (msg.includes("429") || msg.toLowerCase().includes("rate limit") || msg.toLowerCase().includes("quota")) {
+      throw streamError
+    }
+    // Other errors (timeout, network, parse): fallback to template is safe.
     console.warn("[DeepWiki] assembly LLM errored, using template:", streamError.message)
     return { prompt: templateAssembly(context), fellBack: true }
   }
