@@ -130,6 +130,10 @@ export interface DeepWikiSourceConfig {
   /** Cooldown (seconds) after a 429 (rate limit) before the DeepWiki channel
    *  resumes querying. Default 60. */
   retryCooldownSecs?: number
+  /** When true, DeepWiki source files force-replace entity body on re-ingest
+   *  (high confidence from code -> overrides conflicting descriptions from
+   *  other sources). Default false (use existing merge logic). */
+  forceReplaceBody?: boolean
 }
 
 /**

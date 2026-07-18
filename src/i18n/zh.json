@@ -720,7 +720,8 @@
         "mcpJsonError": "无效 JSON",
         "deepWikiMaxConcurrent": "最大并发查询数",
         "deepWikiReuseSessions": "复用固定会话(减少服务端会话数,软清空上下文)",
-        "deepWikiRetryCooldown": "429后重试冷却时间(秒)"
+        "deepWikiRetryCooldown": "429后重试冷却时间(秒)",
+        "deepWikiForceReplaceBody": "重新入图时强制替换正文(DeepWiki覆盖冲突描述)"
       },
       "network": {
         "title": "网络",

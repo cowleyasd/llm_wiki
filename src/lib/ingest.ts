@@ -1923,8 +1923,12 @@ async function writeFileBlocks(
         // that source. Merging the old body back into the new generation kept
         // retracted wording alive indefinitely. Multi-source pages still use
         // the merger because their other sources' contributions must survive.
+        // DeepWiki sources can force-replace body (high confidence from code)
+        // when deepWiki.forceReplaceBody is enabled.
+        const isDeepWikiSource = sourceFileName.startsWith("deepwiki-")
+        const forceReplace = isDeepWikiSource && useWikiStore.getState().searchApiConfig?.deepWiki?.forceReplaceBody === true
         const replaceExistingBody = Boolean(
-          existing && isOwnedOnlyBySource(existing, sourceFileName),
+          existing && (isOwnedOnlyBySource(existing, sourceFileName) || forceReplace),
         )
         const merged = await mergePageContent(
           content,

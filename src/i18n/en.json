@@ -720,7 +720,8 @@
         "mcpJsonError": "Invalid JSON",
         "deepWikiMaxConcurrent": "Max concurrent queries",
         "deepWikiReuseSessions": "Reuse fixed sessions (fewer server sessions, soft context clear)",
-        "deepWikiRetryCooldown": "Retry cooldown (seconds after 429)"
+        "deepWikiRetryCooldown": "Retry cooldown (seconds after 429)",
+        "deepWikiForceReplaceBody": "Force replace body on re-ingest (DeepWiki overrides conflicts)"
       },
       "network": {
         "title": "Network",

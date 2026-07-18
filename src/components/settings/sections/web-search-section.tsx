@@ -739,6 +739,17 @@ function DeepWikiConfigCard({
                 onChange={(e) => onSave({ retryCooldownSecs: Number(e.target.value) || 60 })}
               />
             </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="dw-force-replace"
+                checked={cfg.forceReplaceBody ?? false}
+                onChange={(e) => onSave({ forceReplaceBody: e.target.checked })}
+              />
+              <Label htmlFor="dw-force-replace" className="text-xs">
+                {t("settings.sections.webSearch.deepWikiForceReplaceBody", "Force replace body on re-ingest (DeepWiki overrides conflicts)")}
+              </Label>
+            </div>
           </div>
           <div className="space-y-1">
             <Label className="text-xs">
