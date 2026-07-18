@@ -712,6 +712,14 @@ function DeepWikiConfigCard({
                 onChange={(e) => onSave({ maxSnippetChars: Number(e.target.value) || 4000 })}
               />
             </div>
+            <div className="space-y-1">
+              <Label className="text-xs">{t("settings.sections.webSearch.deepWikiMaxConcurrent", "Max concurrent queries")}</Label>
+              <Input
+                type="number"
+                value={cfg.maxConcurrent ?? 3}
+                onChange={(e) => onSave({ maxConcurrent: Number(e.target.value) || 3 })}
+              />
+            </div>
           </div>
           <div className="space-y-1">
             <Label className="text-xs">

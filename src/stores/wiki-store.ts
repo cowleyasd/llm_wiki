@@ -116,6 +116,10 @@ export interface DeepWikiSourceConfig {
   assemblyInstruction?: string
   timeoutSecs?: number
   maxSnippetChars?: number
+  /** Max concurrent DeepWiki queries for this space (default 3). DeepWiki
+   *  service cannot handle unbounded concurrency; this caps how many
+   *  runDeepWikiQueryRecord workers run at once per project. */
+  maxConcurrent?: number
 }
 
 /**

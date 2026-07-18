@@ -5,7 +5,24 @@ import * as os from "os"
 import {
   createDeepWikiRecord, loadDeepWikiRecords, saveDeepWikiRecords,
   appendRecord, runDeepWikiQueryRecord, triggerDeepWikiQuery,
+  processDeepWikiQueue, retryAllFailedDeepWiki,
 } from "./deepwiki-channel"
+import type { LlmConfig, DeepWikiSourceConfig } from "@/stores/wiki-store"
+
+// Build a scheduler ctx for direct worker/scheduler calls in tests.
+function ctxFor(overrides: Partial<DeepWikiSourceConfig> = {}, projectId = "proj-1") {
+  return {
+    projectPath: tmpDir!,
+    projectId,
+    llmConfig: { provider: "openai", apiKey: "k", model: "m" } as LlmConfig,
+    deepWikiConfig: {
+      enabled: true, baseUrl: "u", spaceId: "s", model: "m", token: "t",
+      branch: "main", timeoutSecs: 60, maxSnippetChars: 10000,
+      ...overrides,
+    } as DeepWikiSourceConfig,
+    maxConcurrent: overrides.maxConcurrent ?? 3,
+  }
+}
 
 // Tests run in Node (vitest); the MODULE under test must NOT use Node fs — it
 // uses @/commands/fs (Tauri). Mock @/commands/fs and wire to real Node IO on a
@@ -86,11 +103,9 @@ describe("runDeepWikiQueryRecord", () => {
     ;(invoke as any).mockResolvedValue({ content: "DeepWiki answer body", spaceUrl: "http://dw" })
 
     const record = createDeepWikiRecord({ topic: "T", prompt: "assembled-prompt" })
-    const llmConfig: any = { provider: "openai", apiKey: "k", model: "m" }
-    const dwConfig: any = { enabled: true, baseUrl: "u", spaceId: "s", model: "m", token: "t", branch: "main", timeoutSecs: 60, maxSnippetChars: 10000 }
 
     await appendRecord(tmpDir!, record) // seed so patch can find it
-    await runDeepWikiQueryRecord(tmpDir!, record, llmConfig, dwConfig, "proj-1")
+    await runDeepWikiQueryRecord(ctxFor(), record)
 
     const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
     expect(persisted.status).toBe("ingested")
@@ -110,7 +125,7 @@ describe("runDeepWikiQueryRecord", () => {
 
     const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
     await appendRecord(tmpDir!, record)
-    await runDeepWikiQueryRecord(tmpDir!, record, {} as any, {} as any, "proj-1")
+    await runDeepWikiQueryRecord(ctxFor(), record)
     const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
     expect(persisted.status).toBe("failed")
     expect(persisted.error).toMatch(/empty/i)
@@ -123,7 +138,7 @@ describe("runDeepWikiQueryRecord", () => {
     ;(invoke as any).mockRejectedValue(new Error("timeout"))
     const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
     await appendRecord(tmpDir!, record)
-    await runDeepWikiQueryRecord(tmpDir!, record, {} as any, {} as any, "proj-1")
+    await runDeepWikiQueryRecord(ctxFor(), record)
     const persisted = (await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!
     expect(persisted.status).toBe("failed")
     expect(persisted.error).toMatch(/timeout/)
@@ -146,7 +161,7 @@ describe("runDeepWikiQueryRecord — ingest onComplete → graphed/failed + term
 
     const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
     await appendRecord(tmpDir!, record)
-    await runDeepWikiQueryRecord(tmpDir!, record, {} as any, {} as any, "proj-1")
+    await runDeepWikiQueryRecord(ctxFor(), record)
 
     // Before the ingest callback fires, the record stays at ingested.
     expect((await loadDeepWikiRecords(tmpDir!)).find((r) => r.id === record.id)!.status).toBe("ingested")
@@ -174,7 +189,7 @@ describe("runDeepWikiQueryRecord — ingest onComplete → graphed/failed + term
 
     const record = createDeepWikiRecord({ topic: "T", prompt: "p" })
     await appendRecord(tmpDir!, record)
-    await runDeepWikiQueryRecord(tmpDir!, record, {} as any, {} as any, "proj-1")
+    await runDeepWikiQueryRecord(ctxFor(), record)
     capturedCb!(false, [], "ingest failed")
     await new Promise((r) => setTimeout(r, 10))
 
@@ -265,5 +280,82 @@ describe("triggerDeepWikiQuery assembly timeout", () => {
     await expect(p).rejects.toThrow(/abort/i)
     expect(await loadDeepWikiRecords(tmpDir!)).toEqual([])
     vi.useRealTimers()
+  })
+})
+
+describe("concurrency limiter", () => {
+  it("processDeepWikiQueue respects maxConcurrent (no overshoot)", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    // Make invoke block until each test releases it, so workers stay in-flight
+    // and we can observe the concurrency cap.
+    let inflight = 0
+    let maxObserved = 0
+    const releaseQueue: Array<() => void> = []
+    ;(invoke as any).mockImplementation(() => {
+      inflight++
+      maxObserved = Math.max(maxObserved, inflight)
+      return new Promise((resolve) => {
+        releaseQueue.push(() => {
+          inflight--
+          resolve({ content: "answer", spaceUrl: "" })
+        })
+      })
+    })
+
+    // 5 prompt_ready records, maxConcurrent = 2.
+    const records = Array.from({ length: 5 }, (_, i) =>
+      createDeepWikiRecord({ topic: `t${i}`, prompt: `p${i}` }),
+    )
+    await saveDeepWikiRecords(tmpDir!, records)
+    const c = ctxFor({ maxConcurrent: 2 })
+    void processDeepWikiQueue(c).catch(() => {})
+
+    // Let the scheduler claim up to 2 and start workers.
+    await new Promise((r) => setTimeout(r, 30))
+    expect(maxObserved).toBe(2)
+    expect(inflight).toBe(2)
+    // 3 still prompt_ready (not yet claimed).
+    const after1 = await loadDeepWikiRecords(tmpDir!)
+    expect(after1.filter((r) => r.status === "prompt_ready")).toHaveLength(3)
+    expect(after1.filter((r) => r.status === "searching")).toHaveLength(2)
+
+    // Release one worker → slot frees → next prompt_ready claimed.
+    releaseQueue.shift()!()
+    await new Promise((r) => setTimeout(r, 30))
+    expect(maxObserved).toBe(2) // never exceeded 2
+    expect(inflight).toBe(2)
+
+    // Release workers in waves: each release frees a slot → scheduler claims
+    // the next prompt_ready → its invoke pushes a new release onto the queue.
+    // Loop until no inflight invoke remains and records settle.
+    for (let i = 0; i < 30 && releaseQueue.length; i++) {
+      while (releaseQueue.length) releaseQueue.shift()!()
+      await new Promise((r) => setTimeout(r, 30))
+    }
+    await new Promise((r) => setTimeout(r, 50))
+    const final = await loadDeepWikiRecords(tmpDir!)
+    // All 5 reached ingested (enqueueIngest mock resolves immediately; slot
+    // released in finally). None left prompt_ready/searching.
+    expect(final.filter((r) => r.status === "prompt_ready" || r.status === "searching")).toHaveLength(0)
+    expect(final.filter((r) => r.status === "ingested")).toHaveLength(5)
+  })
+
+  it("retryAllFailedDeepWiki resets failed → prompt_ready and re-runs under cap", async () => {
+    const { invoke } = await import("@tauri-apps/api/core")
+    ;(invoke as any).mockResolvedValue({ content: "answer", spaceUrl: "" })
+
+    const failed = Array.from({ length: 4 }, (_, i) =>
+      ({ ...createDeepWikiRecord({ topic: `f${i}`, prompt: `pf${i}` }), status: "failed" as const, error: "boom" }),
+    )
+    await saveDeepWikiRecords(tmpDir!, failed)
+
+    await retryAllFailedDeepWiki(tmpDir!, {} as any, { maxConcurrent: 2 } as any, "proj-1")
+    await new Promise((r) => setTimeout(r, 50))
+
+    const final = await loadDeepWikiRecords(tmpDir!)
+    // All 4 re-ran (invoke called 4 times) and reached ingested.
+    expect((invoke as any).mock.calls).toHaveLength(4)
+    expect(final.filter((r) => r.status === "failed")).toHaveLength(0)
+    expect(final.filter((r) => r.status === "ingested")).toHaveLength(4)
   })
 })

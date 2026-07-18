@@ -23,6 +23,90 @@ async function patchRecord(
   return updated
 }
 
+// ── Concurrency limiter ────────────────────────────────────────────────────
+// DeepWiki service cannot handle unbounded concurrency. The scheduler caps
+// how many runDeepWikiQueryRecord workers run at once per project (default 3,
+// configurable via DeepWikiSourceConfig.maxConcurrent). The slot covers only
+// the DeepWiki query stage (invoke + write source + enqueueIngest); once
+// enqueued, the slot is released (try/finally) and ingest runs in the serial
+// ingest-queue — so DeepWiki query throughput is decoupled from ingest speed.
+//
+// Per-project counters (Map<projectPath, number>) avoid cross-project
+// starvation: project A's workers don't consume project B's slots.
+const deepWikiRunning = new Map<string, number>()
+
+interface SchedulerCtx {
+  projectPath: string
+  projectId: string
+  llmConfig: LlmConfig
+  deepWikiConfig: DeepWikiSourceConfig
+  maxConcurrent: number
+}
+
+/**
+ * Atomically claim one prompt_ready record: inside withRecordsLock, check
+// capacity (running < maxConcurrent), increment running, flip the earliest
+// prompt_ready → searching, persist, return it. Returns null when at capacity
+// or no prompt_ready remains. Doing capacity-check + running++ + status-claim
+// in ONE lock callback makes the three steps atomic — concurrent
+// processDeepWikiQueue callers can't each see a free slot and overshoot.
+ * (mutateRecord is NOT used here — it takes the same lock and the chain is
+ * non-reentrant, which would deadlock.)
+ */
+async function claimNextPromptReady(ctx: SchedulerCtx): Promise<DeepWikiQueryRecord | null> {
+  return withRecordsLock(ctx.projectPath, async () => {
+    const pp = normalizePath(ctx.projectPath)
+    const running = deepWikiRunning.get(pp) ?? 0
+    if (running >= ctx.maxConcurrent) return null
+    const records = await loadDeepWikiRecords(ctx.projectPath)
+    // Earliest prompt_ready (FIFO by createdAt).
+    let targetIdx = -1
+    let targetCreatedAt = Infinity
+    for (let i = 0; i < records.length; i++) {
+      const r = records[i]
+      if (r.status === "prompt_ready" && r.createdAt < targetCreatedAt) {
+        targetCreatedAt = r.createdAt
+        targetIdx = i
+      }
+    }
+    if (targetIdx < 0) return null
+    records[targetIdx] = { ...records[targetIdx], status: "searching", error: null }
+    await writeRecordsRaw(ctx.projectPath, records)
+    deepWikiRunning.set(pp, running + 1)
+    useDeepWikiStore.getState().updateRecord(records[targetIdx].id, records[targetIdx])
+    return records[targetIdx]
+  })
+}
+
+/** Release one slot and pump the queue. Called from worker's finally. */
+function releaseSlotAndPump(ctx: SchedulerCtx): void {
+  const pp = normalizePath(ctx.projectPath)
+  const cur = deepWikiRunning.get(pp) ?? 0
+  deepWikiRunning.set(pp, Math.max(0, cur - 1))
+  void processDeepWikiQueue(ctx).catch((err) =>
+    console.warn("[deepwiki-channel] pump failed:", err),
+  )
+}
+
+/**
+ * Pull prompt_ready records up to the concurrency cap and start workers.
+ * Safe to call concurrently — claimNextPromptReady serializes claims inside
+ * the per-project lock, so concurrent callers won't double-claim or overshoot.
+ */
+export async function processDeepWikiQueue(ctx: SchedulerCtx): Promise<void> {
+  // Drain available slots. Each claim is atomic; when at capacity or no
+  // prompt_ready left, claimNextPromptReady returns null and we stop.
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const claimed = await claimNextPromptReady(ctx)
+    if (!claimed) return
+    const record = claimed
+    // Worker releases its own slot in finally and pumps the queue.
+    void runDeepWikiQueryRecord(ctx, record)
+      .catch((err) => console.warn("[deepwiki-channel] worker crashed:", err))
+  }
+}
+
 /**
  * Async worker: search DeepWiki with the record's stored prompt, write source
  * file, enqueue for ingest. Updates record status through
@@ -36,42 +120,46 @@ async function patchRecord(
  * any late `ingested` patch.
  */
 export async function runDeepWikiQueryRecord(
-  projectPath: string,
+  ctx: SchedulerCtx,
   record: DeepWikiQueryRecord,
-  _llmConfig: LlmConfig,
-  deepWikiConfig: DeepWikiSourceConfig,
-  projectId: string,
 ): Promise<void> {
-  await patchRecord(projectPath, record.id, { status: "searching", error: null })
-
+  // Status was already flipped to "searching" by claimNextPromptReady (the
+  // scheduler holds the slot from that point). Worker does NOT re-patch
+  // searching. The slot is released in finally below — covers success, empty
+  // response, search throw, and write/enqueue errors.
   try {
     const result = await invoke<DeepWikiSearchResult>("deepwiki_search", {
       prompt: record.prompt,
-      config: deepWikiConfig,
+      config: ctx.deepWikiConfig,
     })
     if (!result.content?.trim()) {
       throw new Error("DeepWiki returned an empty response")
     }
-    const srcPath = sourceFilePath(projectPath, record.id)
+    const srcPath = sourceFilePath(ctx.projectPath, record.id)
     await writeFileAtomic(srcPath, result.content)
     // 1. Durably persist `ingested` first so the terminal guard has
     //    something non-terminal to upgrade from.
-    await patchRecord(projectPath, record.id, { status: "ingested" })
+    await patchRecord(ctx.projectPath, record.id, { status: "ingested" })
     // 2. Enqueue with a completion callback. The callback may fire
     //    synchronously (early-exit failures) or much later (after
     //    autoIngest finishes). The terminal guard ensures `graphed` /
     //    `failed` written here cannot be regressed by a stray `ingested`.
-    await enqueueIngest(projectId, srcPath, "", (success, _writtenFiles, error) => {
-      void patchRecord(projectPath, record.id, {
+    await enqueueIngest(ctx.projectId, srcPath, "", (success, _writtenFiles, error) => {
+      void patchRecord(ctx.projectPath, record.id, {
         status: success ? "graphed" : "failed",
         error: success ? null : (error ?? "ingest failed"),
       })
     })
   } catch (err) {
-    await patchRecord(projectPath, record.id, {
+    await patchRecord(ctx.projectPath, record.id, {
       status: "failed",
       error: err instanceof Error ? err.message : String(err),
     })
+  } finally {
+    // Release the slot regardless of outcome, then pump the queue so the next
+    // prompt_ready record starts. Slot release is just a decrement (no
+    // capacity race — only the claim path increments, under the lock).
+    releaseSlotAndPump(ctx)
   }
 }
 
@@ -116,14 +204,19 @@ export async function triggerDeepWikiQuery(
   await appendRecord(projectPath, record)
   useDeepWikiStore.getState().addRecord(record)
 
-  // Fire-and-forget the async search+ingest. Errors land in record.status=failed.
-  void runDeepWikiQueryRecord(projectPath, record, llmConfig, deepWikiConfig, projectId)
-    .catch((err) => console.warn("[deepwiki-channel] worker crashed:", err))
+  // Pump the scheduler — it claims prompt_ready records up to maxConcurrent
+  // and starts workers. The record just appended is eligible immediately.
+  const ctx = makeCtx(projectPath, projectId, llmConfig, deepWikiConfig)
+  void processDeepWikiQueue(ctx).catch((err) =>
+    console.warn("[deepwiki-channel] schedule failed:", err),
+  )
 
   return record.id
 }
 
-/** Retry: reuse stored prompt, re-run worker (status reset to searching inside). */
+/** Retry: reuse stored prompt. Resets failed → prompt_ready (force-bypassing
+ *  the terminal guard) then pumps the scheduler. The scheduler caps
+ *  concurrency, so批量重试也不会打爆 DeepWiki. */
 export async function retryDeepWikiQuery(
   projectPath: string,
   recordId: string,
@@ -131,17 +224,71 @@ export async function retryDeepWikiQuery(
   deepWikiConfig: DeepWikiSourceConfig,
   projectId: string,
 ): Promise<void> {
+  const updated = await mutateRecord(
+    projectPath,
+    recordId,
+    { status: "prompt_ready", error: null },
+    { force: true },
+  )
+  if (updated) useDeepWikiStore.getState().updateRecord(recordId, updated)
+  const ctx = makeCtx(projectPath, projectId, llmConfig, deepWikiConfig)
+  void processDeepWikiQueue(ctx).catch((err) =>
+    console.warn("[deepwiki-channel] retry schedule failed:", err),
+  )
+}
+
+/** Retry all failed records at once. Each is reset to prompt_ready (force),
+ *  then the scheduler drains them respecting maxConcurrent. */
+export async function retryAllFailedDeepWiki(
+  projectPath: string,
+  llmConfig: LlmConfig,
+  deepWikiConfig: DeepWikiSourceConfig,
+  projectId: string,
+): Promise<void> {
   const records = await loadDeepWikiRecords(projectPath)
-  const record = records.find((r) => r.id === recordId)
-  if (!record) throw new Error(`DeepWiki record not found: ${recordId}`)
-  await runDeepWikiQueryRecord(projectPath, record, llmConfig, deepWikiConfig, projectId)
+  const failed = records.filter((r) => r.status === "failed")
+  for (const r of failed) {
+    const updated = await mutateRecord(
+      projectPath,
+      r.id,
+      { status: "prompt_ready", error: null },
+      { force: true },
+    )
+    if (updated) useDeepWikiStore.getState().updateRecord(r.id, updated)
+  }
+  const ctx = makeCtx(projectPath, projectId, llmConfig, deepWikiConfig)
+  void processDeepWikiQueue(ctx).catch((err) =>
+    console.warn("[deepwiki-channel] retry-all schedule failed:", err),
+  )
+}
+
+function makeCtx(
+  projectPath: string,
+  projectId: string,
+  llmConfig: LlmConfig,
+  deepWikiConfig: DeepWikiSourceConfig,
+): SchedulerCtx {
+  return {
+    projectPath,
+    projectId,
+    llmConfig,
+    deepWikiConfig,
+    maxConcurrent: normalizeMaxConcurrent(deepWikiConfig.maxConcurrent),
+  }
+}
+
+function normalizeMaxConcurrent(v: number | undefined): number {
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 3
+  return Math.floor(v)
 }
 
 /**
- * Restart recovery: load persisted records, hydrate the store, and re-run the
- * async worker for any record left mid-flight (prompt_ready / searching) when
- * the app closed. ingested / failed records are left as-is. Workers are
- * fire-and-forget (same as trigger) — their errors land in record.status=failed.
+ * Restart recovery: load persisted records, hydrate the store, reset any
+ * mid-flight records (prompt_ready / searching) to prompt_ready, then pump
+ * the scheduler. searching records were interrupted by the crash — reset
+ * them so the scheduler re-claims them (DeepWiki queries are idempotent:
+ * same prompt → same answer, source file overwrites, entities union-merge).
+ * ingested / failed / graphed records are left as-is.
  */
 export async function resumeDeepWikiQueries(
   projectPath: string,
@@ -151,12 +298,23 @@ export async function resumeDeepWikiQueries(
 ): Promise<void> {
   const records = await loadDeepWikiRecords(projectPath)
   useDeepWikiStore.getState().setRecords(records)
-  const toResume = records.filter((r) => r.status === "prompt_ready" || r.status === "searching")
-  for (const r of toResume) {
-    void runDeepWikiQueryRecord(projectPath, r, llmConfig, deepWikiConfig, projectId).catch((err) =>
-      console.warn(`[deepwiki-channel] resume failed for ${r.id}:`, err),
-    )
+  // Reset mid-flight (prompt_ready stays; searching → prompt_ready) so the
+  // scheduler can claim them. searching→prompt_ready is non-terminal→non-
+  // terminal, no force needed.
+  for (const r of records) {
+    if (r.status === "searching") {
+      const updated = await mutateRecord(
+        projectPath,
+        r.id,
+        { status: "prompt_ready", error: null },
+      )
+      if (updated) useDeepWikiStore.getState().updateRecord(r.id, updated)
+    }
   }
+  const ctx = makeCtx(projectPath, projectId, llmConfig, deepWikiConfig)
+  void processDeepWikiQueue(ctx).catch((err) =>
+    console.warn("[deepwiki-channel] resume schedule failed:", err),
+  )
 }
 
 export type DeepWikiQueryStatus =
@@ -266,6 +424,7 @@ export async function mutateRecord(
   projectPath: string,
   id: string,
   patch: Partial<DeepWikiQueryRecord>,
+  options?: { force?: boolean },
 ): Promise<DeepWikiQueryRecord | null> {
   return withRecordsLock(projectPath, async () => {
     const records = await loadDeepWikiRecords(projectPath)
@@ -274,11 +433,13 @@ export async function mutateRecord(
     const current = records[idx]
     const applied: Partial<DeepWikiQueryRecord> = { ...patch }
     if (
+      !options?.force &&
       patch.status !== undefined &&
       isTerminalStatus(current.status) &&
       !isTerminalStatus(patch.status)
     ) {
       // Reject the status downgrade; keep all other patch fields.
+      // `force` (used by retry) bypasses this to allow failed → prompt_ready.
       delete applied.status
     }
     records[idx] = { ...current, ...applied }
