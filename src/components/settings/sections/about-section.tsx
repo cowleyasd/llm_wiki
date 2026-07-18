@@ -220,15 +220,15 @@ export function AboutSection() {
            */}
           <a
             className="cursor-pointer underline underline-offset-2 hover:text-primary"
-            href="https://github.com/nashsu/llm_wiki"
+            href="https://github.com/cowleyasd/llm_wiki"
             onClick={(e) => {
               e.preventDefault()
-              void openUrl("https://github.com/nashsu/llm_wiki").catch((err) => {
+              void openUrl("https://github.com/cowleyasd/llm_wiki").catch((err) => {
                 console.error("[about] openUrl failed:", err)
               })
             }}
           >
-            github.com/nashsu/llm_wiki
+            github.com/cowleyasd/llm_wiki
           </a>
         </p>
       </div>

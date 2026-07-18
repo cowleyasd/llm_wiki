@@ -395,7 +395,7 @@ The original is platform-agnostic (abstract pattern). We handle concrete cross-p
 
 ### Pre-built Binaries
 
-Download from [Releases](https://github.com/nashsu/llm_wiki/releases):
+Download from [Releases](https://github.com/cowleyasd/llm_wiki/releases):
 - **macOS**: `.dmg` (Apple Silicon + Intel)
 - **Windows**: `.msi`
 - **Linux**: `.deb` / `.AppImage`
@@ -404,7 +404,7 @@ Download from [Releases](https://github.com/nashsu/llm_wiki/releases):
 
 ```bash
 # Prerequisites: Node.js 20+, Rust 1.70+
-git clone https://github.com/nashsu/llm_wiki.git
+git clone https://github.com/cowleyasd/llm_wiki.git
 cd llm_wiki
 npm install
 npm run tauri dev      # Development
